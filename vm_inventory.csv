@@ -1,0 +1,14 @@
+vm_name,platform,datacenter,vcenter,resource_group
+ausncchf1con001,azure,northcentralus,,USNC-SHARED-INFRA-RG
+adewcchf1con001,azure,germanywestcentral,,DEWC-PROD-INFRA-RG
+AUSSCSIT2MSG002,azure,southcentralus,,USSC-PROD-SIT-RG
+ausscsol1agt002,azure,southcentralus,,USSC-PROD-SOL-RG
+ausscado1agt002,azure,southcentralus,,USSC-SHARED-INFRA-RG
+ausscvlt1app003,azure,southcentralus,,USSC-SHARED-INFRA-RG
+ausscvlt1app004,azure,southcentralus,,USSC-SHARED-INFRA-RG
+ausscvlt1app005,azure,southcentralus,,USSC-SHARED-INFRA-RG
+AUSSCSIT2MSG001,azure,southcentralus,,USSC-PROD-SIT-RG
+ausscsol1agt001,azure,southcentralus,,USSC-PROD-SOL-RG
+ausscado1agt001,azure,southcentralus,,USSC-SHARED-INFRA-RG
+ausscvlt1app001,azure,southcentralus,,USSC-SHARED-INFRA-RG
+ausscvlt1app002,azure,southcentralus,,USSC-SHARED-INFRA-RG
