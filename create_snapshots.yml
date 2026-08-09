@@ -116,14 +116,35 @@
       changed_when: false
       when: azure_vms | length > 0
 
+    # Best-effort: the SDK import check below is the real gate, so a partial
+    # failure here must not abort the run.
     - name: Install Azure Python SDK from collection requirements file
       ansible.builtin.command:
         cmd: >-
           /usr/bin/python3 -m pip install --quiet --break-system-packages
           -r {{ az_req_file.stdout }}
+      register: az_pip_install
+      failed_when: false
       when:
         - azure_vms | length > 0
         - az_req_file.stdout | default('') | length > 0
+      changed_when: true
+
+    # Distro-packaged deps (packaging, requests, six...) are installed by apt and
+    # carry no RECORD file, so pip cannot uninstall them to upgrade and aborts with
+    # "Cannot uninstall X, RECORD file not found". --ignore-installed sidesteps the
+    # uninstall entirely: fresh copies land in site-packages and shadow the apt ones.
+    - name: Retry SDK install ignoring distro-managed packages
+      ansible.builtin.command:
+        cmd: >-
+          /usr/bin/python3 -m pip install --quiet --break-system-packages
+          --ignore-installed -r {{ az_req_file.stdout }}
+      register: az_pip_retry
+      failed_when: false
+      when:
+        - azure_vms | length > 0
+        - az_req_file.stdout | default('') | length > 0
+        - az_pip_install.rc | default(0) != 0
       changed_when: true
 
     # Only reached when the collection's own requirements file cannot be found.
@@ -174,6 +195,8 @@
           azure-mgmt-automation
           azure-mgmt-apimanagement
           azure-mgmt-datafactory
+      register: az_pip_fallback
+      failed_when: false
       when:
         - azure_vms | length > 0
         - az_req_file.stdout | default('') | length == 0
@@ -193,10 +216,14 @@
       ansible.builtin.fail:
         msg: >-
           Azure Python SDK is incomplete — every azure_rm_* module would fail with
-          "Failed to import the required Python library". Install the collection
-          requirements manually:
-          pip install --break-system-packages -r <azcollection>/requirements.txt
-          Import error was: {{ az_sdk_check.stderr | default('') | trim }}
+          "Failed to import the required Python library".
+          Import error: {{ az_sdk_check.stderr | default('') | trim }}
+          Last pip error: {{ (az_pip_retry.stderr | default(''))
+                             or (az_pip_install.stderr | default(''))
+                             or (az_pip_fallback.stderr | default('none')) | trim }}
+          Fix manually with:
+          /usr/bin/python3 -m pip install --break-system-packages --ignore-installed
+          -r {{ az_req_file.stdout | default('<azcollection>/requirements.txt') }}
       when:
         - azure_vms | length > 0
         - az_sdk_check.rc | default(0) != 0
