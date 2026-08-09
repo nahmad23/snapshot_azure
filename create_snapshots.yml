@@ -66,10 +66,26 @@
         'vcenter'        not in vm_csv.list[0] or
         'resource_group' not in vm_csv.list[0]
 
+    # read_csv has no notion of comments, so a row commented out with a leading
+    # "#" would otherwise be processed as a VM literally named "#name".
+    # Drop those, plus blank rows, before anything else looks at the list.
+    - name: Drop commented-out and blank rows from the CSV
+      ansible.builtin.set_fact:
+        vm_rows: >-
+          {{ vm_csv.list
+             | rejectattr('vm_name', 'match', '^\s*#')
+             | rejectattr('vm_name', 'match', '^\s*$')
+             | list }}
+
+    - name: Report rows ignored as comments or blanks
+      ansible.builtin.debug:
+        msg: "Ignored {{ vm_csv.list | length - vm_rows | length }} commented/blank CSV row(s)"
+      when: vm_csv.list | length != vm_rows | length
+
     - name: Split VMs by platform
       ansible.builtin.set_fact:
-        vcenter_vms_all: "{{ vm_csv.list | selectattr('platform', 'equalto', 'vcenter') | list }}"
-        azure_vms:       "{{ vm_csv.list | selectattr('platform', 'equalto', 'azure')   | list }}"
+        vcenter_vms_all: "{{ vm_rows | selectattr('platform', 'equalto', 'vcenter') | list }}"
+        azure_vms:       "{{ vm_rows | selectattr('platform', 'equalto', 'azure')   | list }}"
 
     - name: Extract unique vCenter hostnames
       ansible.builtin.set_fact:
@@ -78,48 +94,117 @@
     # -------------------------------------------------------------------------
     # Install Azure Python SDK dependencies when Azure VMs are present
     # -------------------------------------------------------------------------
+    # azcollection 1.x ships "requirements-azure.txt"; 2.x renamed it to
+    # "requirements.txt". Search both names, and search every collection root
+    # rather than a hardcoded list — the path differs between galaxy installs,
+    # distro packages and pip installs.
     - name: Find Azure collection requirements file
-      ansible.builtin.find:
-        paths:
-          - "{{ lookup('env', 'HOME') }}/.ansible/collections/ansible_collections/azure/azcollection"
-          - /usr/share/ansible/collections/ansible_collections/azure/azcollection
-          - /usr/lib/python3/dist-packages/ansible_collections/azure/azcollection
-        patterns: "requirements-azure.txt"
-        recurse: false
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: >-
+          find
+          "$HOME/.ansible/collections"
+          /usr/share/ansible/collections
+          /usr/local/share/ansible/collections
+          /usr/lib/python3/dist-packages/ansible_collections
+          /usr/local/lib/python3*/dist-packages/ansible_collections
+          -maxdepth 6 -type f
+          \( -name requirements-azure.txt -o -name requirements.txt \)
+          -path '*azure/azcollection/*'
+          -print 2>/dev/null | head -n 1
       register: az_req_file
+      changed_when: false
       when: azure_vms | length > 0
 
     - name: Install Azure Python SDK from collection requirements file
       ansible.builtin.command:
         cmd: >-
           /usr/bin/python3 -m pip install --quiet --break-system-packages
-          -r {{ az_req_file.files[0].path }}
+          -r {{ az_req_file.stdout }}
       when:
         - azure_vms | length > 0
-        - az_req_file.files | default([]) | length > 0
+        - az_req_file.stdout | default('') | length > 0
       changed_when: true
 
+    # Only reached when the collection's own requirements file cannot be found.
+    # Must cover everything azure_rm_common.py imports at module load — a single
+    # missing package makes every azure_rm_* module fail with
+    # "Failed to import the required Python library".
     - name: Install core Azure Python SDK packages (fallback if requirements file not found)
       ansible.builtin.command:
         cmd: >-
           /usr/bin/python3 -m pip install --quiet --break-system-packages
-          msrestazure
+          packaging requests xmltodict msrest msrestazure
+          azure-common azure-core azure-identity azure-nspkg
+          azure-storage-blob
+          azure-mgmt-core
           "azure-mgmt-compute>=21.0.0"
           "azure-mgmt-resource>=21.0.0"
           "azure-mgmt-network>=19.0.0"
           "azure-mgmt-storage>=19.0.0"
-          azure-common
-          azure-identity
-          azure-core
+          azure-mgmt-authorization
+          azure-mgmt-dns
+          azure-mgmt-privatedns
+          azure-mgmt-keyvault
+          azure-mgmt-monitor
+          azure-mgmt-trafficmanager
+          azure-mgmt-containerservice
+          azure-mgmt-containerregistry
+          azure-mgmt-containerinstance
+          azure-mgmt-managedservices
+          azure-mgmt-managementgroups
+          azure-mgmt-marketplaceordering
+          azure-mgmt-redis
+          azure-mgmt-search
+          azure-mgmt-servicebus
+          azure-mgmt-sql
+          azure-mgmt-web
+          azure-mgmt-cdn
+          azure-mgmt-batch
+          azure-mgmt-cosmosdb
+          azure-mgmt-devtestlabs
+          azure-mgmt-eventhub
+          azure-mgmt-hdinsight
+          azure-mgmt-iothub
+          azure-mgmt-loganalytics
+          azure-mgmt-notificationhubs
+          azure-mgmt-rdbms
+          azure-mgmt-recoveryservices
+          azure-mgmt-recoveryservicesbackup
+          azure-mgmt-automation
+          azure-mgmt-apimanagement
+          azure-mgmt-datafactory
       when:
         - azure_vms | length > 0
-        - az_req_file.files | default([]) | length == 0
+        - az_req_file.stdout | default('') | length == 0
       changed_when: true
+
+    - name: Verify the Azure SDK imports cleanly before touching Azure
+      ansible.builtin.command:
+        cmd: >-
+          /usr/bin/python3 -c
+          "import azure.mgmt.compute, azure.mgmt.dns, azure.mgmt.resource, azure.identity"
+      register: az_sdk_check
+      changed_when: false
+      failed_when: false
+      when: azure_vms | length > 0
+
+    - name: Abort early with a clear message if the Azure SDK is incomplete
+      ansible.builtin.fail:
+        msg: >-
+          Azure Python SDK is incomplete — every azure_rm_* module would fail with
+          "Failed to import the required Python library". Install the collection
+          requirements manually:
+          pip install --break-system-packages -r <azcollection>/requirements.txt
+          Import error was: {{ az_sdk_check.stderr | default('') | trim }}
+      when:
+        - azure_vms | length > 0
+        - az_sdk_check.rc | default(0) != 0
 
     - name: Show platforms and counts detected in CSV
       ansible.builtin.debug:
         msg:
-          - "CSV loaded: {{ vm_csv.list | length }} total VMs"
+          - "CSV loaded: {{ vm_rows | length }} usable VMs ({{ vm_csv.list | length }} rows read)"
           - "  VMware vCenter VMs : {{ vcenter_vms_all | length }} across {{ vcenter_hosts | length }} vCenter(s)"
           - "  Azure VMs          : {{ azure_vms | length }}"
 
@@ -255,7 +340,7 @@
           - " SNAPSHOT RUN COMPLETE"
           - "========================================="
           - " Snapshot name : {{ snap_name }}"
-          - " CSV inventory : {{ vm_csv.list | length }} VMs total"
+          - " CSV inventory : {{ vm_rows | length }} VMs total"
           - " VMware vCenters: {{ vcenter_hosts | default([]) | length }}"
           - " Azure VMs      : {{ azure_vms | default([]) | length }}"
           - "-----------------------------------------"

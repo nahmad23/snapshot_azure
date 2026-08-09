@@ -80,14 +80,56 @@
 
 - name: Warn about VMs where no managed OS disk was found
   ansible.builtin.debug:
-    msg: "SKIPPED (no managed OS disk found in resource group): {{ item.item.vm_name }}"
+    msg: "NO OS DISK (VM found, but no managed OS disk attached in its resource group): {{ item.item.vm_name }}"
   loop: "{{ az_vm_info.results | default([]) }}"
   loop_control:
     label: "{{ item.item.vm_name }}"
+  register: _az_nodisk
   when:
     - not item.failed
     - item.vms | default([]) | length > 0
     - (az_os_disk_map | default({}))[item.vms[0].id | lower] is not defined
+
+# These VMs never reach azure_rm_snapshot, so without this they would be
+# counted as neither succeeded nor failed and vanish from the totals.
+- name: Collect VMs that had no managed OS disk
+  ansible.builtin.set_fact:
+    _az_nodisk_names: >-
+      {{ _az_nodisk.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | map(attribute='item.item.vm_name')
+         | list }}
+
+- name: "Azure — why each VM failed (VM lookup stage)"
+  ansible.builtin.debug:
+    msg: "LOOKUP FAILED: {{ item.item.vm_name }} — {{ item.msg | default('no message') }}"
+  loop: "{{ az_vm_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.vm_name }}"
+  when: item.failed | default(false)
+
+- name: "Azure — VMs not found in the given resource group"
+  ansible.builtin.debug:
+    msg: >-
+      NOT FOUND: {{ item.item.vm_name }} — no VM by that name in resource group
+      '{{ item.item.resource_group }}'. Check the vm_name/resource_group spelling in the CSV.
+  loop: "{{ az_vm_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.vm_name }}"
+  when:
+    - not (item.failed | default(false))
+    - item.vms | default([]) | length == 0
+
+- name: "Azure — why each VM failed (snapshot stage)"
+  ansible.builtin.debug:
+    msg: "SNAPSHOT FAILED: {{ item.item.item.vm_name }} — {{ item.msg | default('no message') }}"
+  loop: "{{ az_snap_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.vm_name | default('unknown') }}"
+  when:
+    - item.skipped is not defined
+    - item.failed | default(false)
 
 - name: Build Azure snapshot summary
   ansible.builtin.set_fact:
@@ -116,7 +158,8 @@
             | selectattr('vms', 'defined')
             | selectattr('vms', 'equalto', [])
             | map(attribute='item.vm_name')
-            | list) }}
+            | list)
+         + (_az_nodisk_names | default([])) }}
 
 - name: Append Azure results to snapshot_results
   ansible.builtin.set_fact:
