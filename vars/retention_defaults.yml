@@ -1,0 +1,28 @@
+---
+# vars/retention_defaults.yml
+# Defaults for delete_snapshots.yml.
+#
+# These live in a vars file rather than a play's `vars:` block because play
+# vars do NOT carry across play boundaries — only facts do. The deletion
+# playbook spans four plays, so anything referenced after play 1 has to be
+# loaded by every play via vars_files.
+#
+# Extra vars still win, so all of these stay overridable at runtime:
+#   -e retention_days=30 -e dry_run=true
+
+# Snapshots at or beyond this age (in days) are deleted.
+retention_days: 10
+
+# Set true to report what would be deleted without deleting anything.
+dry_run: false
+
+# Azure: only delete snapshots carrying the "snapshot_name" tag that
+# create_snapshots.yml sets. Turning this off makes EVERY snapshot in the
+# swept resource groups eligible for deletion.
+require_snapshot_tag: true
+
+# vCenter: only delete snapshots whose name matches this pattern.
+snapshot_name_pattern: '^\d{8}-security-Updates$'
+
+# ARM API version used to list Microsoft.Compute/snapshots.
+azure_snapshot_api_version: "2023-04-02"

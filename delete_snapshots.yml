@@ -32,26 +32,15 @@
   hosts: localhost
   gather_facts: false
 
+  # retention_defaults.yml must be loaded by EVERY play: play vars do not cross
+  # play boundaries, and plays 2-4 reference retention_days, dry_run,
+  # require_snapshot_tag, snapshot_name_pattern and azure_snapshot_api_version.
   vars_files:
     - vars/azure_vault.yml
+    - vars/retention_defaults.yml
 
   vars:
-    # Snapshots at or beyond this age (in days) are deleted.
-    retention_days: 10
-
-    # Set true to report what would be deleted without deleting anything.
-    dry_run: false
-
-    # Only delete Azure snapshots tagged by create_snapshots.yml.
-    # Turning this off makes EVERY snapshot in the resource group eligible.
-    require_snapshot_tag: true
-
-    # Only delete vCenter snapshots whose name matches this pattern.
-    snapshot_name_pattern: '^\d{8}-security-Updates$'
-
     csv_file: "vm_inventory.csv"
-
-    azure_snapshot_api_version: "2023-04-02"
 
   tasks:
     - name: Validate CSV file exists
@@ -175,6 +164,9 @@
   hosts: localhost
   gather_facts: false
 
+  vars_files:
+    - vars/retention_defaults.yml
+
   tasks:
     - name: Process Azure snapshot retention
       ansible.builtin.include_tasks: tasks/delete_snapshot_azure.yml
@@ -186,6 +178,9 @@
 - name: Delete expired vCenter snapshots
   hosts: localhost
   gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
 
   tasks:
     - name: Process vCenter snapshot retention
@@ -202,6 +197,9 @@
 - name: Final combined report
   hosts: localhost
   gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
 
   tasks:
     - name: Per-source deletion results
