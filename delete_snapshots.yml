@@ -1,0 +1,250 @@
+---
+# Playbook: delete_snapshots.yml
+# Retention cleanup for snapshots created by create_snapshots.yml.
+# Deletes any snapshot older than `retention_days` (default 10) counted from
+# the snapshot's own creation timestamp — not from its name.
+#
+# SAFETY — a snapshot is only ever deleted when BOTH hold:
+#   1. it is older than retention_days, AND
+#   2. it is recognisably ours:
+#        Azure   - carries the "snapshot_name" tag that create_snapshots.yml sets
+#                  (disable with -e require_snapshot_tag=false)
+#        vCenter - its name matches snapshot_name_pattern
+#                  (default: ^\d{8}-security-Updates$)
+# Snapshots taken by anyone else are listed as "not managed by this playbook"
+# and left untouched.
+#
+# Preview without deleting anything:
+#   ansible-playbook -i inventory.ini delete_snapshots.yml \
+#     --vault-password-file ~/.vault_pass -e dry_run=true
+#
+# Normal run (deletes):
+#   ansible-playbook -i inventory.ini delete_snapshots.yml \
+#     --vault-password-file ~/.vault_pass
+#
+# Different retention window:
+#   ... -e retention_days=30
+#
+# Reads the same vm_inventory.csv as create_snapshots.yml — the CSV supplies
+# which resource groups / vCenters to sweep.
+
+- name: Load inventory and find expired snapshots
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/azure_vault.yml
+
+  vars:
+    # Snapshots at or beyond this age (in days) are deleted.
+    retention_days: 10
+
+    # Set true to report what would be deleted without deleting anything.
+    dry_run: false
+
+    # Only delete Azure snapshots tagged by create_snapshots.yml.
+    # Turning this off makes EVERY snapshot in the resource group eligible.
+    require_snapshot_tag: true
+
+    # Only delete vCenter snapshots whose name matches this pattern.
+    snapshot_name_pattern: '^\d{8}-security-Updates$'
+
+    csv_file: "vm_inventory.csv"
+
+    azure_snapshot_api_version: "2023-04-02"
+
+  tasks:
+    - name: Validate CSV file exists
+      ansible.builtin.stat:
+        path: "{{ csv_file }}"
+      register: csv_stat
+
+    - name: Abort if CSV file not found
+      ansible.builtin.fail:
+        msg: "CSV file '{{ csv_file }}' not found. Please check the path."
+      when: not csv_stat.stat.exists
+
+    - name: Load VM inventory from CSV
+      community.general.read_csv:
+        path: "{{ csv_file }}"
+      register: vm_csv
+
+    - name: Drop commented-out and blank rows from the CSV
+      ansible.builtin.set_fact:
+        vm_rows: >-
+          {{ vm_csv.list
+             | rejectattr('vm_name', 'match', '^\s*#')
+             | rejectattr('vm_name', 'match', '^\s*$')
+             | list }}
+
+    - name: Split VMs by platform
+      ansible.builtin.set_fact:
+        vcenter_vms_all: "{{ vm_rows | selectattr('platform', 'equalto', 'vcenter') | list }}"
+        azure_vms:       "{{ vm_rows | selectattr('platform', 'equalto', 'azure')   | list }}"
+
+    - name: Extract unique vCenter hostnames
+      ansible.builtin.set_fact:
+        vcenter_hosts: "{{ vcenter_vms_all | map(attribute='vcenter') | unique | list | sort }}"
+
+    # Azure resource group names are case-insensitive; lowercase them so the
+    # same RG spelled two ways in the CSV is swept once, not twice.
+    - name: Extract unique Azure resource groups
+      ansible.builtin.set_fact:
+        azure_rgs: >-
+          {{ azure_vms | map(attribute='resource_group') | map('lower') | unique | list | sort }}
+
+    - name: Ensure the Azure Python SDK is usable
+      ansible.builtin.include_tasks: tasks/ensure_azure_sdk.yml
+      when: azure_vms | length > 0
+
+    - name: Initialise result accumulator
+      ansible.builtin.set_fact:
+        deletion_results: []
+        cacheable: false
+
+    - name: Show retention settings
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " SNAPSHOT RETENTION CLEANUP"
+          - "========================================="
+          - " Retention window : {{ retention_days }} days"
+          - " Mode             : {{ 'DRY RUN — nothing will be deleted' if dry_run | bool else 'DELETE' }}"
+          - " Azure RGs        : {{ azure_rgs | length }}"
+          - " vCenters         : {{ vcenter_hosts | length }}"
+          - " Azure tag guard  : {{ 'on (only snapshots tagged by create_snapshots.yml)' if require_snapshot_tag | bool else 'OFF — all snapshots eligible' }}"
+          - " vCenter name guard: {{ snapshot_name_pattern }}"
+          - "========================================="
+
+    # -------------------------------------------------------------------------
+    # vCenter credentials — prompted only when vCenter VMs are present
+    # -------------------------------------------------------------------------
+    - name: "Prompt — vCenter username (shared for all vCenters)"
+      ansible.builtin.pause:
+        prompt: "vCenter username (e.g. administrator@vsphere.local)"
+      register: vc_user_input
+      when: vcenter_vms_all | length > 0
+
+    - name: "Prompt — vCenter password"
+      ansible.builtin.pause:
+        prompt: "vCenter password (used for all vCenters)"
+        echo: false
+      register: vc_pass_input
+      no_log: true
+      when: vcenter_vms_all | length > 0
+
+    - name: Build vCenter credentials map (shared for all vCenters)
+      ansible.builtin.set_fact:
+        vcenter_creds: >-
+          {{ vcenter_creds | default({}) | combine({
+               item: {
+                 'host':     item,
+                 'user':     vc_user_input.user_input,
+                 'password': vc_pass_input.user_input
+               }
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+      when: vcenter_vms_all | length > 0
+
+    - name: Build Azure credentials from vault
+      ansible.builtin.set_fact:
+        azure_creds:
+          subscription_id: "{{ vault_azure_subscription_id }}"
+          tenant:          "{{ vault_azure_tenant_id }}"
+          client_id:       "{{ vault_azure_client_id }}"
+          secret:          "{{ vault_azure_secret }}"
+      no_log: true
+      when: azure_vms | length > 0
+
+    - name: Build VMs-by-vCenter map
+      ansible.builtin.set_fact:
+        vms_by_vcenter: >-
+          {{ vms_by_vcenter | default({}) | combine({
+               item: vcenter_vms_all | selectattr('vcenter', 'equalto', item) | list
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+      when: vcenter_vms_all | length > 0
+
+# ---------------------------------------------------------------------------
+# Azure snapshot cleanup
+# ---------------------------------------------------------------------------
+- name: Delete expired Azure snapshots
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Process Azure snapshot retention
+      ansible.builtin.include_tasks: tasks/delete_snapshot_azure.yml
+      when: azure_vms | default([]) | length > 0
+
+# ---------------------------------------------------------------------------
+# vCenter snapshot cleanup
+# ---------------------------------------------------------------------------
+- name: Delete expired vCenter snapshots
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Process vCenter snapshot retention
+      ansible.builtin.include_tasks: tasks/delete_snapshot_vcenter.yml
+      loop: "{{ vcenter_hosts | default([]) }}"
+      loop_control:
+        loop_var: current_vc_host
+        label: "{{ current_vc_host }}"
+      when: vcenter_hosts | default([]) | length > 0
+
+# ---------------------------------------------------------------------------
+# Combined final report
+# ---------------------------------------------------------------------------
+- name: Final combined report
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Per-source deletion results
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ item.source }} ==="
+          - "  Snapshots found   : {{ item.found }}"
+          - "  Not ours (skipped): {{ item.unmanaged }}"
+          - "  Within retention  : {{ item.retained }}"
+          - "  Expired           : {{ item.expired | length }}"
+          - "  Deleted           : {{ item.deleted | length }}"
+          - "  Delete failures   : {{ item.failed if item.failed else 'none' }}"
+      loop: "{{ deletion_results }}"
+      loop_control:
+        label: "{{ item.source }}"
+
+    - name: Overall retention report
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " RETENTION CLEANUP COMPLETE"
+          - "========================================="
+          - " Mode            : {{ 'DRY RUN — nothing deleted' if dry_run | bool else 'DELETE' }}"
+          - " Retention window: {{ retention_days }} days"
+          - " Total expired   : {{ deletion_results | map(attribute='expired') | map('length') | sum }}"
+          - " Total deleted   : {{ deletion_results | map(attribute='deleted') | map('length') | sum }}"
+          - " Total failed    : {{ deletion_results | map(attribute='failed')  | map('length') | sum }}"
+          - "========================================="
+
+    - name: List all failed deletions
+      ansible.builtin.debug:
+        msg: "DELETE FAILED on {{ item.0.source }}: {{ item.1 }}"
+      loop: >-
+        {{ deletion_results
+           | selectattr('failed', 'ne', [])
+           | subelements('failed') }}
+      loop_control:
+        label: "{{ item.1 }}"
+      when: deletion_results | map(attribute='failed') | map('length') | sum > 0
+
+    - name: Fail playbook if any deletion failed
+      ansible.builtin.fail:
+        msg: >-
+          {{ deletion_results | map(attribute='failed') | map('length') | sum }}
+          snapshot(s) failed to delete. See list above.
+      when: deletion_results | map(attribute='failed') | map('length') | sum > 0

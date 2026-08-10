@@ -1,0 +1,178 @@
+---
+# tasks/delete_snapshot_azure.yml
+# Called once from delete_snapshots.yml when Azure VMs are present in the CSV.
+# Expects:
+#   azure_rgs            - unique lowercase resource group names from the CSV
+#   azure_creds          - dict {subscription_id, tenant, client_id, secret}
+#   retention_days       - snapshots at/beyond this age are deleted
+#   dry_run              - when true, report only
+#   require_snapshot_tag - when true, only snapshots tagged by create_snapshots.yml
+#   deletion_results     - list accumulating per-source summaries
+#
+# azcollection has no azure_rm_snapshot_info module, so snapshots are listed
+# through the generic ARM resource endpoint, which also returns the
+# properties.timeCreated we need for the age calculation.
+
+- name: List all snapshots in each resource group
+  azure.azcollection.azure_rm_resource_info:
+    resource_group:  "{{ item }}"
+    provider:        Microsoft.Compute
+    resource_type:   snapshots
+    api_version:     "{{ azure_snapshot_api_version }}"
+    subscription_id: "{{ azure_creds.subscription_id }}"
+    tenant:          "{{ azure_creds.tenant }}"
+    client_id:       "{{ azure_creds.client_id }}"
+    secret:          "{{ azure_creds.secret }}"
+  loop: "{{ azure_rgs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: az_snap_list
+  ignore_errors: true
+
+- name: Report resource groups that could not be listed
+  ansible.builtin.debug:
+    msg: "LIST FAILED for resource group '{{ item.item }}' — {{ item.msg | default('no message') }}"
+  loop: "{{ az_snap_list.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.failed | default(false)
+
+# Flatten every snapshot across every resource group into one list, computing
+# its age up front — Jinja's selectattr cannot do arithmetic, so age_days has
+# to exist as a plain attribute before the list can be filtered on it.
+# timeCreated looks like "2026-08-09T10:03:31.4250530+00:00"; the first 19
+# characters are the portion to_datetime can parse.
+- name: Flatten snapshot list and compute each snapshot's age
+  ansible.builtin.set_fact:
+    az_all_snaps: >-
+      {{ az_all_snaps | default([]) + [{
+           'resource_group': item.0.item,
+           'name':           item.1.name,
+           'created':        item.1.properties.timeCreated | default(''),
+           'tags':           item.1.tags | default({}, true),
+           'age_days':       (
+                               ( now(utc=true)
+                                 - (item.1.properties.timeCreated[:19]
+                                    | to_datetime('%Y-%m-%dT%H:%M:%S'))
+                               ).days
+                             )
+         }] }}
+  loop: "{{ az_snap_list.results | default([]) | subelements('response', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.name }}"
+  when:
+    - not (item.0.failed | default(false))
+    - item.1.properties.timeCreated is defined
+
+- name: Separate snapshots this playbook manages from everything else
+  ansible.builtin.set_fact:
+    az_managed_snaps: >-
+      {{ az_all_snaps | default([])
+         | selectattr('tags.snapshot_name', 'defined')
+         | list
+         if require_snapshot_tag | bool
+         else az_all_snaps | default([]) }}
+    az_unmanaged_snaps: >-
+      {{ az_all_snaps | default([])
+         | rejectattr('tags.snapshot_name', 'defined')
+         | list
+         if require_snapshot_tag | bool
+         else [] }}
+
+- name: Select snapshots past the retention window
+  ansible.builtin.set_fact:
+    az_expired_snaps: >-
+      {{ az_managed_snaps | selectattr('age_days', 'ge', retention_days | int) | list }}
+    az_retained_snaps: >-
+      {{ az_managed_snaps | rejectattr('age_days', 'ge', retention_days | int) | list }}
+
+- name: Show snapshots left alone because they are not managed by this playbook
+  ansible.builtin.debug:
+    msg: "NOT OURS (no snapshot_name tag, left untouched): {{ item.resource_group }}/{{ item.name }}"
+  loop: "{{ az_unmanaged_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Show snapshots still inside the retention window
+  ansible.builtin.debug:
+    msg: "KEEP ({{ item.age_days }}d old, under {{ retention_days }}d): {{ item.resource_group }}/{{ item.name }}"
+  loop: "{{ az_retained_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Show snapshots selected for deletion
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'WOULD DELETE' if dry_run | bool else 'DELETE' }}
+      ({{ item.age_days }}d old, created {{ item.created }}):
+      {{ item.resource_group }}/{{ item.name }}
+  loop: "{{ az_expired_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Delete expired Azure snapshots
+  azure.azcollection.azure_rm_snapshot:
+    resource_group:  "{{ item.resource_group }}"
+    name:            "{{ item.name }}"
+    state:           absent
+    subscription_id: "{{ azure_creds.subscription_id }}"
+    tenant:          "{{ azure_creds.tenant }}"
+    client_id:       "{{ azure_creds.client_id }}"
+    secret:          "{{ azure_creds.secret }}"
+  loop: "{{ az_expired_snaps }}"
+  loop_control:
+    label: "{{ item.resource_group }}/{{ item.name }}"
+  register: az_delete_results
+  ignore_errors: true
+  when: not (dry_run | bool)
+
+- name: Report why each deletion failed
+  ansible.builtin.debug:
+    msg: "DELETE FAILED: {{ item.item.resource_group }}/{{ item.item.name }} — {{ item.msg | default('no message') }}"
+  loop: "{{ az_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when:
+    - item.skipped is not defined
+    - item.failed | default(false)
+
+- name: Build Azure deletion summary
+  ansible.builtin.set_fact:
+    _az_deleted: >-
+      {{ az_delete_results.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | selectattr('failed', 'equalto', false)
+         | map(attribute='item.name')
+         | list }}
+    _az_del_failed: >-
+      {{ az_delete_results.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | selectattr('failed', 'equalto', true)
+         | map(attribute='item.name')
+         | list }}
+
+- name: Append Azure results to deletion_results
+  ansible.builtin.set_fact:
+    deletion_results: >-
+      {{ deletion_results + [{
+           'source':    'Azure',
+           'found':     az_all_snaps | default([]) | length,
+           'unmanaged': az_unmanaged_snaps | length,
+           'retained':  az_retained_snaps | length,
+           'expired':   az_expired_snaps | map(attribute='name') | list,
+           'deleted':   _az_deleted,
+           'failed':    _az_del_failed
+         }] }}
+
+- name: Azure — deletion summary
+  ansible.builtin.debug:
+    msg:
+      - "=== Azure — retention {{ retention_days }} days ==="
+      - "  Snapshots found   : {{ az_all_snaps | default([]) | length }}"
+      - "  Not ours (skipped): {{ az_unmanaged_snaps | length }}"
+      - "  Within retention  : {{ az_retained_snaps | length }}"
+      - "  Expired           : {{ az_expired_snaps | length }}"
+      - "  Deleted           : {{ _az_deleted | length }}{{ ' (dry run — none actually deleted)' if dry_run | bool else '' }}"
+      - "  Delete failures   : {{ _az_del_failed if _az_del_failed else 'none' }}"

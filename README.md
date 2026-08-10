@@ -112,6 +112,62 @@ PLAY 4 — Final report
   └─ Exit non-zero if any failed
 ```
 
+## Snapshot retention / deletion (`delete_snapshots.yml`)
+
+Deletes snapshots older than `retention_days` (default **10**), counted from the
+snapshot's own creation timestamp in Azure/vCenter — not from its name, so
+renamed or manually created snapshots are still aged correctly.
+
+```bash
+# Preview only — lists what would be deleted, deletes nothing
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass -e dry_run=true
+
+# Real run
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass
+
+# Different retention window
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass -e retention_days=30
+```
+
+### Safety
+
+A snapshot is deleted only when **both** conditions hold: it is at or beyond
+the retention age, **and** it is recognisably created by this playbook.
+
+| Platform | "Ours" test | Override |
+|---|---|---|
+| Azure | Carries the `snapshot_name` tag set by `create_snapshots.yml` | `-e require_snapshot_tag=false` |
+| vCenter | Name matches `^\d{8}-security-Updates$` | `-e snapshot_name_pattern='...'` |
+
+Anything else in the same resource group is reported as `NOT OURS` and left
+untouched. Turning off `require_snapshot_tag` makes **every** snapshot in the
+swept resource groups eligible — don't do it without a dry run first.
+
+### Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `retention_days` | `10` | Age in days at which a snapshot is deleted |
+| `dry_run` | `false` | `true` reports without deleting |
+| `require_snapshot_tag` | `true` | Azure: only delete snapshots tagged by `create_snapshots.yml` |
+| `snapshot_name_pattern` | `^\d{8}-security-Updates$` | vCenter: only delete snapshots matching this regex |
+| `csv_file` | `vm_inventory.csv` | Supplies the resource groups / vCenters to sweep |
+
+### Scheduling
+
+Runs unattended with no prompts as long as the CSV is Azure-only:
+
+```cron
+30 2 * * * cd /data/ansible/snapshot/snapshot_new/snapshot_azure && \
+  ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass >> /var/log/snapshot_cleanup.log 2>&1
+```
+
+The playbook exits non-zero if any deletion fails, so cron/AWX will flag it.
+
 ## Tuning
 
 **Batch size** (`batch_size` in `create_snapshots.yml`, default `10`):

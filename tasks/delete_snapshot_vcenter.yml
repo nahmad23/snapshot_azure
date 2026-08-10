@@ -1,0 +1,176 @@
+---
+# tasks/delete_snapshot_vcenter.yml
+# Called once per vCenter via include_tasks loop in delete_snapshots.yml.
+# Expects:
+#   current_vc_host       - vCenter hostname (loop_var)
+#   vcenter_creds         - dict {hostname: {host, user, password}}
+#   vms_by_vcenter        - dict {hostname: [vm list]}
+#   retention_days        - snapshots at/beyond this age are deleted
+#   dry_run               - when true, report only
+#   snapshot_name_pattern - only snapshots matching this regex are eligible
+#   deletion_results      - list accumulating per-source summaries
+#
+# NOTE: this path is untested against a live vCenter — the CSV in this repo
+# contains only Azure rows. Run with -e dry_run=true the first time.
+
+- name: "Set working vars for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc: "{{ vcenter_creds[current_vc_host] }}"
+    _vms: "{{ vms_by_vcenter[current_vc_host] }}"
+
+- name: "Gather existing snapshots for each VM on {{ current_vc_host }}"
+  community.vmware.vmware_guest_snapshot_info:
+    hostname:       "{{ _vc.host }}"
+    username:       "{{ _vc.user }}"
+    password:       "{{ _vc.password }}"
+    validate_certs: false
+    datacenter:     "{{ item.datacenter }}"
+    folder:         "/{{ item.datacenter }}/vm"
+    name:           "{{ item.vm_name }}"
+  loop: "{{ _vms }}"
+  loop_control:
+    label: "{{ item.vm_name }}"
+  register: _vc_snap_info
+  ignore_errors: true
+
+- name: "Report VMs whose snapshots could not be listed on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: "LIST FAILED: {{ item.item.vm_name }} — {{ item.msg | default('no message') }}"
+  loop: "{{ _vc_snap_info.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.vm_name }}"
+  when: item.failed | default(false)
+
+# creation_time comes back as e.g. "2026-08-09T10:03:31.123456+00:00"; the
+# first 19 characters are the part to_datetime can parse. Age is computed here
+# because Jinja's selectattr cannot do arithmetic during filtering.
+- name: "Flatten snapshot list and compute age for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_all_snaps: >-
+      {{ _vc_all_snaps | default([]) + [{
+           'vm_name':  item.0.item.vm_name,
+           'name':     item.1.name,
+           'created':  item.1.creation_time | default(''),
+           'age_days': (
+                         ( now(utc=true)
+                           - (item.1.creation_time | string
+                              | regex_replace('^(.{19}).*$', '\\1')
+                              | to_datetime('%Y-%m-%dT%H:%M:%S'))
+                         ).days
+                       )
+         }] }}
+  loop: >-
+    {{ _vc_snap_info.results | default([]) | subelements('guest_snapshots.snapshots', skip_missing=True) }}
+  loop_control:
+    label: "{{ item.0.item.vm_name }}/{{ item.1.name }}"
+  when:
+    - not (item.0.failed | default(false))
+    - item.1.creation_time is defined
+
+- name: "Split managed vs unmanaged snapshots on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_managed_snaps: >-
+      {{ _vc_all_snaps | default([]) | selectattr('name', 'match', snapshot_name_pattern) | list }}
+    _vc_unmanaged_snaps: >-
+      {{ _vc_all_snaps | default([]) | rejectattr('name', 'match', snapshot_name_pattern) | list }}
+
+- name: "Select snapshots past the retention window on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_expired_snaps: >-
+      {{ _vc_managed_snaps | selectattr('age_days', 'ge', retention_days | int) | list }}
+    _vc_retained_snaps: >-
+      {{ _vc_managed_snaps | rejectattr('age_days', 'ge', retention_days | int) | list }}
+
+- name: "Show snapshots left alone on {{ current_vc_host }} (name does not match pattern)"
+  ansible.builtin.debug:
+    msg: "NOT OURS (left untouched): {{ item.vm_name }} / {{ item.name }}"
+  loop: "{{ _vc_unmanaged_snaps }}"
+  loop_control:
+    label: "{{ item.vm_name }}/{{ item.name }}"
+
+- name: "Show snapshots still inside the retention window on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: "KEEP ({{ item.age_days }}d old, under {{ retention_days }}d): {{ item.vm_name }} / {{ item.name }}"
+  loop: "{{ _vc_retained_snaps }}"
+  loop_control:
+    label: "{{ item.vm_name }}/{{ item.name }}"
+
+- name: "Show snapshots selected for deletion on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'WOULD DELETE' if dry_run | bool else 'DELETE' }}
+      ({{ item.age_days }}d old, created {{ item.created }}):
+      {{ item.vm_name }} / {{ item.name }}
+  loop: "{{ _vc_expired_snaps }}"
+  loop_control:
+    label: "{{ item.vm_name }}/{{ item.name }}"
+
+- name: "Delete expired snapshots on {{ current_vc_host }}"
+  community.vmware.vmware_guest_snapshot:
+    hostname:       "{{ _vc.host }}"
+    username:       "{{ _vc.user }}"
+    password:       "{{ _vc.password }}"
+    validate_certs: false
+    datacenter: >-
+      {{ (_vms | selectattr('vm_name', 'equalto', item.vm_name) | first).datacenter }}
+    folder: >-
+      /{{ (_vms | selectattr('vm_name', 'equalto', item.vm_name) | first).datacenter }}/vm
+    name:          "{{ item.vm_name }}"
+    state:         absent
+    snapshot_name: "{{ item.name }}"
+  loop: "{{ _vc_expired_snaps }}"
+  loop_control:
+    label: "{{ item.vm_name }}/{{ item.name }}"
+  register: _vc_delete_results
+  ignore_errors: true
+  when: not (dry_run | bool)
+
+- name: "Report why each deletion failed on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: "DELETE FAILED: {{ item.item.vm_name }} / {{ item.item.name }} — {{ item.msg | default('no message') }}"
+  loop: "{{ _vc_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when:
+    - item.skipped is not defined
+    - item.failed | default(false)
+
+- name: "Append {{ current_vc_host }} results to deletion_results"
+  ansible.builtin.set_fact:
+    deletion_results: >-
+      {{ deletion_results + [{
+           'source':    current_vc_host,
+           'found':     _vc_all_snaps | default([]) | length,
+           'unmanaged': _vc_unmanaged_snaps | length,
+           'retained':  _vc_retained_snaps | length,
+           'expired':   _vc_expired_snaps | map(attribute='name') | list,
+           'deleted':   _vc_delete_results.results
+                        | default([])
+                        | rejectattr('skipped', 'defined')
+                        | selectattr('failed', 'equalto', false)
+                        | map(attribute='item.name')
+                        | list,
+           'failed':    _vc_delete_results.results
+                        | default([])
+                        | rejectattr('skipped', 'defined')
+                        | selectattr('failed', 'equalto', true)
+                        | map(attribute='item.name')
+                        | list
+         }] }}
+
+# Facts persist across include_tasks iterations, so the accumulators must be
+# cleared or the next vCenter would inherit this one's snapshots.
+- name: "Reset per-vCenter accumulators after {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_all_snaps: []
+
+- name: "{{ current_vc_host }} — deletion summary"
+  ansible.builtin.debug:
+    msg:
+      - "=== {{ current_vc_host }} — retention {{ retention_days }} days ==="
+      - "  Snapshots found   : {{ deletion_results[-1].found }}"
+      - "  Not ours (skipped): {{ deletion_results[-1].unmanaged }}"
+      - "  Within retention  : {{ deletion_results[-1].retained }}"
+      - "  Expired           : {{ deletion_results[-1].expired | length }}"
+      - "  Deleted           : {{ deletion_results[-1].deleted | length }}{{ ' (dry run — none actually deleted)' if dry_run | bool else '' }}"
+      - "  Delete failures   : {{ deletion_results[-1].failed if deletion_results[-1].failed else 'none' }}"
