@@ -74,6 +74,30 @@
     _vc_unmanaged_snaps: >-
       {{ _vc_all_snaps | default([]) | rejectattr('name', 'match', snapshot_name_pattern) | list }}
 
+# Same keyword protection as the Azure path — applied after selection so it
+# overrides the name pattern.
+- name: "Identify keyword-protected snapshots on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_protected_snaps: >-
+      {{ _vc_managed_snaps | selectattr('name', 'search', protected_keyword_regex) | list
+         if protected_name_keywords | default([]) | length > 0
+         else [] }}
+
+- name: "Remove keyword-protected snapshots from the candidates on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_managed_snaps: >-
+      {{ _vc_managed_snaps | rejectattr('name', 'search', protected_keyword_regex) | list }}
+  when: protected_name_keywords | default([]) | length > 0
+
+- name: "Show keyword-protected snapshots on {{ current_vc_host }}"
+  ansible.builtin.debug:
+    msg: >-
+      PROTECTED (name contains a protected keyword, never deleted):
+      {{ item.vm_name }} / {{ item.name }} ({{ item.age_days }}d old)
+  loop: "{{ _vc_protected_snaps }}"
+  loop_control:
+    label: "{{ item.vm_name }}/{{ item.name }}"
+
 - name: "Select snapshots past the retention window on {{ current_vc_host }}"
   ansible.builtin.set_fact:
     _vc_expired_snaps: >-
@@ -141,6 +165,7 @@
       {{ deletion_results + [{
            'source':    current_vc_host,
            'found':     _vc_all_snaps | default([]) | length,
+           'protected': _vc_protected_snaps | default([]) | length,
            'unmanaged': _vc_unmanaged_snaps | length,
            'retained':  _vc_retained_snaps | length,
            'expired':   _vc_expired_snaps | map(attribute='name') | list,
@@ -163,6 +188,7 @@
 - name: "Reset per-vCenter accumulators after {{ current_vc_host }}"
   ansible.builtin.set_fact:
     _vc_all_snaps: []
+    _vc_protected_snaps: []
 
 - name: "{{ current_vc_host }} — deletion summary"
   ansible.builtin.debug:
@@ -170,6 +196,7 @@
       - "=== {{ current_vc_host }} — retention {{ retention_days }} days ==="
       - "  Snapshots found   : {{ deletion_results[-1].found }}"
       - "  Not ours (skipped): {{ deletion_results[-1].unmanaged }}"
+      - "  Keyword-protected : {{ deletion_results[-1].protected }}"
       - "  Within retention  : {{ deletion_results[-1].retained }}"
       - "  Expired           : {{ deletion_results[-1].expired | length }}"
       - "  Deleted           : {{ deletion_results[-1].deleted | length }}{{ ' (dry run — none actually deleted)' if dry_run | bool else '' }}"

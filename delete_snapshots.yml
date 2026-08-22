@@ -11,6 +11,8 @@
 #                  (see snapshot_selection in vars/retention_defaults.yml)
 #        vCenter - its name matches snapshot_name_pattern
 #                  (default: ^\d{8}-security-Updates$)
+#   3. its name does NOT contain a protected keyword (default: "critical",
+#      matched case-insensitively) — this overrides every selection mode
 # Snapshots taken by anyone else are listed as "not managed by this playbook"
 # and left untouched.
 #
@@ -97,6 +99,13 @@
                            | join('|') }})([^a-z0-9]|$)
       when: azure_vms | length > 0
 
+    # (?i) makes the whole alternation case-insensitive, so CRITICAL, critical
+    # and Critical are all protected. Built as a fact so every play can use it.
+    - name: Build the protected-keyword pattern
+      ansible.builtin.set_fact:
+        protected_keyword_regex: "(?i)({{ protected_name_keywords | map('regex_escape') | join('|') }})"
+      when: protected_name_keywords | default([]) | length > 0
+
     - name: Ensure the Azure Python SDK is usable
       ansible.builtin.include_tasks: tasks/ensure_azure_sdk.yml
       when: azure_vms | length > 0
@@ -118,6 +127,7 @@
           - " vCenters         : {{ vcenter_hosts | length }}"
           - " Azure selection  : {{ snapshot_selection }}{{ ' — snapshots belonging to the ' ~ (azure_vms | length) ~ ' VM(s) in the CSV' if snapshot_selection == 'csv_vms' else (' — only snapshots tagged by create_snapshots.yml' if snapshot_selection == 'tagged' else ' — EVERY snapshot in scope, including other teams and base images') }}"
           - " vCenter name guard: {{ snapshot_name_pattern }}"
+          - " Protected keywords: {{ (protected_name_keywords | join(', ') ~ ' (case-insensitive, never deleted)') if protected_name_keywords | default([]) | length > 0 else 'none — keyword protection is OFF' }}"
           - "========================================="
 
     # -------------------------------------------------------------------------
@@ -223,6 +233,7 @@
           - "=== {{ item.source }} ==="
           - "  Snapshots found   : {{ item.found }}"
           - "  Not ours (skipped): {{ item.unmanaged }}"
+          - "  Keyword-protected : {{ item.protected | default(0) }}"
           - "  Within retention  : {{ item.retained }}"
           - "  Expired           : {{ item.expired | length }}"
           - "  Deleted           : {{ item.deleted | length }}"

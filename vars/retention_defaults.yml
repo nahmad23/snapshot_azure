@@ -43,6 +43,15 @@ azure_snapshot_api_version: "2023-04-02"
 # returned — names, tags and timeCreated — when the counts look wrong.
 debug_snapshots: false
 
+# Snapshots whose NAME contains any of these keywords are never deleted, no
+# matter how old they are or which VM they belong to. Matching is
+# case-insensitive, so "CRITICAL", "critical" and "Critical" are all protected.
+# This is the last filter applied, so it overrides every selection mode
+# including snapshot_selection=all.
+# Set to [] to disable the protection entirely.
+protected_name_keywords:
+  - critical
+
 # Limit the run to specific snapshot names. Use this to validate deletion
 # end-to-end against one snapshot instead of setting retention_days=0, which
 # would make every managed snapshot eligible at once. Example:

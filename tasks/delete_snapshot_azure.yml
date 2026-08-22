@@ -165,6 +165,31 @@
         {{ [] }}
       {%- endif -%}
 
+# Applied AFTER selection so it overrides every snapshot_selection mode,
+# including 'all'. Computed in two steps rather than one set_fact, so that
+# az_managed_snaps is never read and rewritten in the same task.
+- name: Identify snapshots protected by a keyword in their name
+  ansible.builtin.set_fact:
+    az_protected_snaps: >-
+      {{ az_managed_snaps | selectattr('name', 'search', protected_keyword_regex) | list
+         if protected_name_keywords | default([]) | length > 0
+         else [] }}
+
+- name: Remove keyword-protected snapshots from the deletion candidates
+  ansible.builtin.set_fact:
+    az_managed_snaps: >-
+      {{ az_managed_snaps | rejectattr('name', 'search', protected_keyword_regex) | list }}
+  when: protected_name_keywords | default([]) | length > 0
+
+- name: Show snapshots protected by a keyword in their name
+  ansible.builtin.debug:
+    msg: >-
+      PROTECTED (name contains a protected keyword, never deleted):
+      {{ item.resource_group }}/{{ item.name }} ({{ item.age_days }}d old)
+  loop: "{{ az_protected_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
 - name: Select snapshots past the retention window
   ansible.builtin.set_fact:
     az_expired_snaps: >-
@@ -280,6 +305,7 @@
       {{ deletion_results + [{
            'source':    'Azure',
            'found':     az_scoped_snaps | default([]) | length,
+           'protected': az_protected_snaps | default([]) | length,
            'unmanaged': az_unmanaged_snaps | length,
            'retained':  az_retained_snaps | length,
            'expired':   az_expired_snaps | map(attribute='name') | list,
@@ -292,6 +318,7 @@
     msg:
       - "=== Azure — retention {{ retention_days }} days ==="
       - "  Snapshots found   : {{ az_scoped_snaps | default([]) | length }} in scope ({{ az_all_snaps | default([]) | length }} in subscription)"
+      - "  Keyword-protected : {{ az_protected_snaps | default([]) | length }}"
       - "  Not ours (skipped): {{ az_unmanaged_snaps | length }}"
       - "  Within retention  : {{ az_retained_snaps | length }}"
       - "  Expired           : {{ az_expired_snaps | length }}"

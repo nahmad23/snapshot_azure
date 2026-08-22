@@ -147,6 +147,12 @@ untouched. `snapshot_selection=all` makes **every** snapshot in the swept
 resource groups eligible, including other teams' snapshots and base images —
 don't use it without a dry run first.
 
+**Keyword protection.** A snapshot whose *name* contains any keyword in
+`protected_name_keywords` (default `critical`) is never deleted, regardless of
+age, owning VM, or selection mode — including `snapshot_selection=all`. Matching
+is case-insensitive, so `CRITICAL`, `critical` and `Critical` are all protected.
+Set the list to `[]` to disable this.
+
 Because ownership is matched on the VM name rather than the snapshot name,
 snapshots are cleaned up regardless of their naming convention and regardless
 of whether `create_snapshots.yml` tagged them.
@@ -160,6 +166,7 @@ of whether `create_snapshots.yml` tagged them.
 | `snapshot_selection` | `csv_vms` | Azure: `csv_vms` (snapshots of CSV VMs), `tagged` (only tagged by `create_snapshots.yml`), or `all` |
 | `sweep_all_resource_groups` | `false` | `true` considers snapshots in every resource group, not just the CSV's |
 | `only_snapshots` | `[]` | Restrict the run to specific snapshot names — for testing |
+| `protected_name_keywords` | `[critical]` | Snapshot names containing any of these are never deleted (case-insensitive) |
 | `snapshot_name_pattern` | `^\d{8}-security-Updates$` | vCenter: only delete snapshots matching this regex |
 | `csv_file` | `vm_inventory.csv` | Supplies the resource groups / vCenters to sweep |
 
