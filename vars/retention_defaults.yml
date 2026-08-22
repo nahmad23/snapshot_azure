@@ -16,10 +16,22 @@ retention_days: 10
 # Set true to report what would be deleted without deleting anything.
 dry_run: false
 
-# Azure: only delete snapshots carrying the "snapshot_name" tag that
-# create_snapshots.yml sets. Turning this off makes EVERY snapshot in the
-# swept resource groups eligible for deletion.
-require_snapshot_tag: true
+# How Azure snapshots are claimed as "ours". One of:
+#
+#   csv_vms  (default) A snapshot belongs to a VM listed in the CSV. Ownership
+#            is matched on the VM name appearing in the snapshot name, in the
+#            source_vm tag, or in the source disk id — so it works no matter
+#            what naming convention the snapshot uses and whether or not it was
+#            tagged by create_snapshots.yml. Snapshots belonging to any other
+#            VM, and snapshots matching no VM at all (base images, manual
+#            backups), are never touched.
+#
+#   tagged   Only snapshots carrying the "snapshot_name" tag set by
+#            create_snapshots.yml. Stricter, but misses untagged snapshots.
+#
+#   all      EVERY snapshot in the swept resource groups. Dangerous — this
+#            deletes other teams' snapshots and base images too.
+snapshot_selection: csv_vms
 
 # vCenter: only delete snapshots whose name matches this pattern.
 snapshot_name_pattern: '^\d{8}-security-Updates$'

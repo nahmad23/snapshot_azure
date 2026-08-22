@@ -7,8 +7,8 @@
 # SAFETY — a snapshot is only ever deleted when BOTH hold:
 #   1. it is older than retention_days, AND
 #   2. it is recognisably ours:
-#        Azure   - carries the "snapshot_name" tag that create_snapshots.yml sets
-#                  (disable with -e require_snapshot_tag=false)
+#        Azure   - belongs to a VM listed in the CSV (snapshot_selection: csv_vms)
+#                  (see snapshot_selection in vars/retention_defaults.yml)
 #        vCenter - its name matches snapshot_name_pattern
 #                  (default: ^\d{8}-security-Updates$)
 # Snapshots taken by anyone else are listed as "not managed by this playbook"
@@ -34,7 +34,7 @@
 
   # retention_defaults.yml must be loaded by EVERY play: play vars do not cross
   # play boundaries, and plays 2-4 reference retention_days, dry_run,
-  # require_snapshot_tag, snapshot_name_pattern and azure_snapshot_api_version.
+  # snapshot_selection, snapshot_name_pattern and azure_snapshot_api_version.
   vars_files:
     - vars/azure_vault.yml
     - vars/retention_defaults.yml
@@ -82,6 +82,21 @@
         azure_rgs: >-
           {{ azure_vms | map(attribute='resource_group') | map('lower') | unique | list | sort }}
 
+    # Ownership is matched on the VM name appearing anywhere in the snapshot's
+    # name, source_vm tag, or source disk id. The boundary groups stop
+    # "app001" from also matching a snapshot belonging to "app0011", and
+    # regex_escape keeps an unusual VM name from being read as a pattern.
+    - name: Build the VM-ownership match pattern from the CSV
+      ansible.builtin.set_fact:
+        azure_vm_names_lower: "{{ azure_vms | map(attribute='vm_name') | map('lower') | list }}"
+        azure_vm_match_regex: >-
+          (^|[^a-z0-9])({{ azure_vms
+                           | map(attribute='vm_name')
+                           | map('lower')
+                           | map('regex_escape')
+                           | join('|') }})([^a-z0-9]|$)
+      when: azure_vms | length > 0
+
     - name: Ensure the Azure Python SDK is usable
       ansible.builtin.include_tasks: tasks/ensure_azure_sdk.yml
       when: azure_vms | length > 0
@@ -101,7 +116,7 @@
           - " Mode             : {{ 'DRY RUN — nothing will be deleted' if dry_run | bool else 'DELETE' }}"
           - " Azure RGs        : {{ azure_rgs | length }}"
           - " vCenters         : {{ vcenter_hosts | length }}"
-          - " Azure tag guard  : {{ 'on (only snapshots tagged by create_snapshots.yml)' if require_snapshot_tag | bool else 'OFF — all snapshots eligible' }}"
+          - " Azure selection  : {{ snapshot_selection }}{{ ' — snapshots belonging to the ' ~ (azure_vms | length) ~ ' VM(s) in the CSV' if snapshot_selection == 'csv_vms' else (' — only snapshots tagged by create_snapshots.yml' if snapshot_selection == 'tagged' else ' — EVERY snapshot in scope, including other teams and base images') }}"
           - " vCenter name guard: {{ snapshot_name_pattern }}"
           - "========================================="
 

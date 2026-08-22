@@ -6,7 +6,8 @@
 #   azure_creds          - dict {subscription_id, tenant, client_id, secret}
 #   retention_days       - snapshots at/beyond this age are deleted
 #   dry_run              - when true, report only
-#   require_snapshot_tag - when true, only snapshots tagged by create_snapshots.yml
+#   snapshot_selection   - csv_vms | tagged | all (see vars/retention_defaults.yml)
+#   azure_vm_match_regex - VM-ownership pattern built from the CSV
 #   deletion_results     - list accumulating per-source summaries
 #
 # azcollection has no azure_rm_snapshot_info module, so snapshots are listed
@@ -87,6 +88,10 @@
            'name':           item.1.name,
            'created':        item.1.properties.timeCreated | default(''),
            'tags':           item.1.tags | default({}, true),
+           'haystack':       (item.1.name
+                              ~ ' ' ~ ((item.1.tags | default({}, true)).source_vm | default(''))
+                              ~ ' ' ~ (item.1.properties.creationData.sourceResourceId | default(''))
+                             ) | lower,
            'age_days':       (
                                ( now(utc=true)
                                  - (item.1.properties.timeCreated[:19]
@@ -129,20 +134,36 @@
       {{ az_scoped_snaps | selectattr('name', 'in', only_snapshots) | list }}
   when: only_snapshots | default([]) | length > 0
 
+# Validated before use: an unrecognised value must not fall through to the
+# permissive 'all' branch below.
+- name: Abort on an unrecognised snapshot_selection value
+  ansible.builtin.fail:
+    msg: >-
+      snapshot_selection must be one of: csv_vms, tagged, all.
+      Got '{{ snapshot_selection }}'.
+  when: snapshot_selection not in ['csv_vms', 'tagged', 'all']
+
+# csv_vms claims a snapshot when the VM name appears in its name, its source_vm
+# tag, or its source disk id — so a snapshot is matched by which VM it belongs
+# to, independent of naming convention or whether it carries our tags.
 - name: Separate snapshots this playbook manages from everything else
   ansible.builtin.set_fact:
     az_managed_snaps: >-
-      {{ az_scoped_snaps | default([])
-         | selectattr('tags.snapshot_name', 'defined')
-         | list
-         if require_snapshot_tag | bool
-         else az_scoped_snaps | default([]) }}
+      {%- if snapshot_selection == 'csv_vms' -%}
+        {{ az_scoped_snaps | default([]) | selectattr('haystack', 'search', azure_vm_match_regex) | list }}
+      {%- elif snapshot_selection == 'tagged' -%}
+        {{ az_scoped_snaps | default([]) | selectattr('tags.snapshot_name', 'defined') | list }}
+      {%- else -%}
+        {{ az_scoped_snaps | default([]) }}
+      {%- endif -%}
     az_unmanaged_snaps: >-
-      {{ az_scoped_snaps | default([])
-         | rejectattr('tags.snapshot_name', 'defined')
-         | list
-         if require_snapshot_tag | bool
-         else [] }}
+      {%- if snapshot_selection == 'csv_vms' -%}
+        {{ az_scoped_snaps | default([]) | rejectattr('haystack', 'search', azure_vm_match_regex) | list }}
+      {%- elif snapshot_selection == 'tagged' -%}
+        {{ az_scoped_snaps | default([]) | rejectattr('tags.snapshot_name', 'defined') | list }}
+      {%- else -%}
+        {{ [] }}
+      {%- endif -%}
 
 - name: Select snapshots past the retention window
   ansible.builtin.set_fact:
@@ -157,10 +178,11 @@
       - "No snapshots qualified for deletion, but {{ az_scoped_snaps | default([]) | length }} in-scope snapshot(s) exist. Reason:"
       - >-
         {% if az_managed_snaps | length == 0 %}
-        None carry the 'snapshot_name' tag, so the tag guard excluded them all.
-        Snapshots created before tagging existed, or created by another tool, look like this.
-        Inspect tags with: ansible-playbook -i inventory.ini list_snapshots.yml --vault-password-file ~/.vault_pass
-        After verifying the list is safe, re-run with -e require_snapshot_tag=false
+        None matched selection mode '{{ snapshot_selection }}'.
+        {% if snapshot_selection == 'csv_vms' %}No snapshot's name, source_vm tag or source
+        disk id contains any VM name from the CSV ({{ azure_vm_names_lower | join(', ') }}).
+        {% else %}None carry the 'snapshot_name' tag.{% endif %}
+        Inspect what exists with: ansible-playbook -i inventory.ini list_snapshots.yml --vault-password-file ~/.vault_pass
         {% else %}
         {{ az_managed_snaps | length }} snapshot(s) are tagged but all are younger than
         {{ retention_days }} day(s). Youngest age: {{ az_managed_snaps | map(attribute='age_days') | min }}d,
@@ -187,7 +209,7 @@
 
 - name: Show snapshots left alone because they are not managed by this playbook
   ansible.builtin.debug:
-    msg: "NOT OURS (no snapshot_name tag, left untouched): {{ item.resource_group }}/{{ item.name }}"
+    msg: "NOT OURS (does not belong to any CSV VM, left untouched): {{ item.resource_group }}/{{ item.name }}"
   loop: "{{ az_unmanaged_snaps }}"
   loop_control:
     label: "{{ item.name }}"

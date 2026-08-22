@@ -139,12 +139,17 @@ the retention age, **and** it is recognisably created by this playbook.
 
 | Platform | "Ours" test | Override |
 |---|---|---|
-| Azure | Carries the `snapshot_name` tag set by `create_snapshots.yml` | `-e require_snapshot_tag=false` |
+| Azure | Belongs to a VM listed in the CSV — matched on the VM name in the snapshot name, the `source_vm` tag, or the source disk id | `-e snapshot_selection=tagged` or `=all` |
 | vCenter | Name matches `^\d{8}-security-Updates$` | `-e snapshot_name_pattern='...'` |
 
 Anything else in the same resource group is reported as `NOT OURS` and left
-untouched. Turning off `require_snapshot_tag` makes **every** snapshot in the
-swept resource groups eligible — don't do it without a dry run first.
+untouched. `snapshot_selection=all` makes **every** snapshot in the swept
+resource groups eligible, including other teams' snapshots and base images —
+don't use it without a dry run first.
+
+Because ownership is matched on the VM name rather than the snapshot name,
+snapshots are cleaned up regardless of their naming convention and regardless
+of whether `create_snapshots.yml` tagged them.
 
 ### Variables
 
@@ -152,7 +157,9 @@ swept resource groups eligible — don't do it without a dry run first.
 |---|---|---|
 | `retention_days` | `10` | Age in days at which a snapshot is deleted |
 | `dry_run` | `false` | `true` reports without deleting |
-| `require_snapshot_tag` | `true` | Azure: only delete snapshots tagged by `create_snapshots.yml` |
+| `snapshot_selection` | `csv_vms` | Azure: `csv_vms` (snapshots of CSV VMs), `tagged` (only tagged by `create_snapshots.yml`), or `all` |
+| `sweep_all_resource_groups` | `false` | `true` considers snapshots in every resource group, not just the CSV's |
+| `only_snapshots` | `[]` | Restrict the run to specific snapshot names — for testing |
 | `snapshot_name_pattern` | `^\d{8}-security-Updates$` | vCenter: only delete snapshots matching this regex |
 | `csv_file` | `vm_inventory.csv` | Supplies the resource groups / vCenters to sweep |
 
