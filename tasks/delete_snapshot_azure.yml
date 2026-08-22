@@ -87,6 +87,11 @@
                              | lower,
            'name':           item.1.name,
            'is_critical':    (item.1.name is search(critical_keyword_regex)),
+           'owner_vm':       ( ((item.1.tags | default({}, true)).source_vm | default(''))
+                               or (azure_vm_names_lower | default([])
+                                   | select('in', (item.1.name ~ ' '
+                                        ~ (item.1.properties.creationData.sourceResourceId | default(''))) | lower)
+                                   | list | first | default('unknown')) ),
            'created':        item.1.properties.timeCreated | default(''),
            'tags':           item.1.tags | default({}, true),
            'haystack':       (item.1.name
@@ -278,6 +283,44 @@
     - item.skipped is not defined
     - item.failed | default(false)
 
+# One row per snapshot that reached the deletion stage, carrying its outcome.
+# Built from the delete results on a real run, and from the expired list on a
+# dry run (where the delete task is skipped and registers no results).
+- name: Build per-snapshot report rows for the run
+  ansible.builtin.set_fact:
+    az_report_rows: >-
+      {{ az_report_rows | default([]) + [ item.item | combine({
+           'status': ('FAILED' if item.failed | default(false) else 'DELETED'),
+           'detail': (item.msg | default('') if item.failed | default(false) else 'removed from Azure')
+         }) ] }}
+  loop: "{{ az_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when: item.skipped is not defined
+
+- name: Build per-snapshot report rows for a dry run
+  ansible.builtin.set_fact:
+    az_report_rows: >-
+      {{ az_report_rows | default([]) + [ item | combine({
+           'status': 'WOULD DELETE',
+           'detail': 'dry run — nothing was deleted'
+         }) ] }}
+  loop: "{{ az_expired_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: dry_run | bool
+
+# "Currently available" = critical snapshots that still exist after this run:
+# those inside the 30-day window, plus any whose deletion failed.
+- name: Determine which critical snapshots are still retained
+  ansible.builtin.set_fact:
+    az_critical_remaining: >-
+      {{ az_critical_snaps
+         | rejectattr('name', 'in', az_report_rows | default([])
+                                    | selectattr('status', 'equalto', 'DELETED')
+                                    | map(attribute='name') | list)
+         | list }}
+
 - name: Build Azure deletion summary
   ansible.builtin.set_fact:
     _az_deleted: >-
@@ -315,7 +358,10 @@
            'deleted':   _az_deleted,
            'failed':    _az_del_failed,
            'deleted_detail': _az_deleted_detail,
-           'expired_detail': az_expired_snaps
+           'expired_detail': az_expired_snaps,
+           'report_rows':    az_report_rows | default([]),
+           'critical_total': az_critical_snaps | default([]) | length,
+           'critical_remaining': az_critical_remaining | default([])
          }] }}
 
 - name: Azure — deletion summary

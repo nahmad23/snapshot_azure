@@ -280,67 +280,108 @@
     - vars/retention_defaults.yml
 
   tasks:
-    - name: Flatten every deleted snapshot across all sources
+    - name: Gather the per-snapshot rows and critical inventory
       ansible.builtin.set_fact:
-        mail_deleted: >-
-          {{ deletion_results | map(attribute='deleted_detail') | default([], true) | flatten }}
-        mail_expired: >-
-          {{ deletion_results | map(attribute='expired_detail') | default([], true) | flatten }}
+        mail_rows: >-
+          {{ deletion_results | map(attribute='report_rows') | default([], true) | flatten }}
+        mail_critical_remaining: >-
+          {{ deletion_results | map(attribute='critical_remaining') | default([], true) | flatten }}
+        mail_critical_total: >-
+          {{ deletion_results | map(attribute='critical_total') | default([], true) | sum }}
 
-    - name: Split the reported snapshots by class
-      ansible.builtin.set_fact:
-        mail_rows: "{{ mail_expired if dry_run | bool else mail_deleted }}"
-
+    # Only rows that actually went (or would go) are counted as deleted;
+    # FAILED rows are reported separately so the totals stay honest.
     - name: Build the summary counts
       ansible.builtin.set_fact:
-        mail_total:    "{{ mail_rows | length }}"
-        mail_critical: "{{ mail_rows | selectattr('is_critical') | list | length }}"
-        mail_ordinary: "{{ mail_rows | rejectattr('is_critical') | list | length }}"
-        mail_failed:   "{{ deletion_results | map(attribute='failed') | map('length') | sum }}"
+        mail_gone: >-
+          {{ mail_rows | rejectattr('status', 'equalto', 'FAILED') | list }}
+        mail_failed_rows: >-
+          {{ mail_rows | selectattr('status', 'equalto', 'FAILED') | list }}
+
+    - name: Derive the headline numbers
+      ansible.builtin.set_fact:
+        mail_total:       "{{ mail_gone | length }}"
+        mail_crit_gone:   "{{ mail_gone | selectattr('is_critical') | list | length }}"
+        mail_ord_gone:    "{{ mail_gone | rejectattr('is_critical') | list | length }}"
+        mail_servers:     "{{ mail_gone | map(attribute='owner_vm') | map('lower') | unique | sort | list }}"
+        mail_failed:      "{{ mail_failed_rows | length }}"
 
     - name: Compose the summary email
       ansible.builtin.set_fact:
         mail_body: |
-          Snapshot retention run on {{ ansible_hostname | default('ansible controller') }}
-          {{ '%s' | format(ansible_date_time.iso8601 | default('')) }}
+          Azure snapshot deletion report
+          Run on {{ ansible_hostname | default('ansible controller') }} at {{ ansible_date_time.iso8601 | default('unknown time') }}
 
-          MODE            : {{ 'DRY RUN — nothing was actually deleted' if dry_run | bool else 'DELETE' }}
-          Retention policy: {{ retention_days }} days ordinary, {{ critical_retention_days }} days for names containing {{ critical_name_keywords | join('/') }}
-          Servers in scope: {{ azure_vm_names_lower | default([]) | join(', ') or 'none' }}
+          MODE             : {{ 'DRY RUN — nothing was actually deleted' if dry_run | bool else 'DELETE' }}
+          Retention policy : {{ retention_days }} days for regular snapshots
+                             {{ critical_retention_days }} days for names containing {{ critical_name_keywords | join('/') | upper }} (case-insensitive)
+          Servers in scope : {{ azure_vm_names_lower | default([]) | join(', ') or 'none' }}
 
-          ------------------------------------------------------------------
+          ==================================================================
           SUMMARY
-          ------------------------------------------------------------------
-          Snapshots {{ 'that would be deleted' if dry_run | bool else 'deleted' }} : {{ mail_total }}
-            of which CRITICAL ({{ critical_retention_days }}d policy)          : {{ mail_critical }}
-            of which ordinary ({{ retention_days }}d policy)                   : {{ mail_ordinary }}
-          Deletion failures                                       : {{ mail_failed }}
+          ==================================================================
+          Total snapshots {{ 'that would be deleted' if dry_run | bool else 'deleted' }}      : {{ mail_total }}
+            Regular snapshots deleted (> {{ retention_days }} days)   : {{ mail_ord_gone }}
+            CRITICAL snapshots deleted (> {{ critical_retention_days }} days)  : {{ mail_crit_gone }}
 
-          ------------------------------------------------------------------
+          CRITICAL snapshots currently available     : {{ mail_critical_remaining | length }}
+            (of {{ mail_critical_total }} critical snapshot(s) seen this run — still inside the {{ critical_retention_days }}-day window)
+
+          Deletion failures                          : {{ mail_failed }}
+
+          ==================================================================
+          SERVERS / VMs SNAPSHOTS WERE DELETED FROM ({{ mail_servers | length }})
+          ==================================================================
+          {% if mail_servers | length == 0 %}
+          none
+          {% else %}
+          {% for v in mail_servers %}
+            - {{ v }}
+          {% endfor %}
+          {% endif %}
+
+          ==================================================================
+          {{ 'SNAPSHOTS THAT WOULD BE DELETED' if dry_run | bool else 'SNAPSHOTS DELETED' }} ({{ mail_rows | length }})
+          ==================================================================
+          {% if mail_rows | length == 0 %}
+          none
+          {% else %}
+          {{ '%-48s %-22s %-20s %6s %-14s %s' | format('SNAPSHOT NAME', 'SERVER / VM', 'RESOURCE GROUP', 'AGE', 'CLASS', 'STATUS') }}
+          {{ '-' * 130 }}
+          {% for r in mail_rows | sort(attribute='name') %}
+          {{ '%-48s %-22s %-20s %5sd %-14s %s' | format(r.name, r.owner_vm | default('-'), r.resource_group | default('-'), r.age_days, ('CRITICAL' if r.is_critical else 'regular'), r.status) }}
+          {% if r.status == 'FAILED' %}
+                 reason: {{ r.detail }}
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+
+          ==================================================================
+          CRITICAL SNAPSHOTS RETAINED — NOT YET {{ critical_retention_days }} DAYS OLD ({{ mail_critical_remaining | length }})
+          ==================================================================
+          {% if mail_critical_remaining | length == 0 %}
+          none
+          {% else %}
+          {{ '%-48s %-22s %-20s %6s %s' | format('SNAPSHOT NAME', 'SERVER / VM', 'RESOURCE GROUP', 'AGE', 'DELETE DUE IN') }}
+          {{ '-' * 122 }}
+          {% for r in mail_critical_remaining | sort(attribute='age_days', reverse=true) %}
+          {{ '%-48s %-22s %-20s %5sd %s' | format(r.name, r.owner_vm | default(r.vm_name | default('-')), r.resource_group | default('-'), r.age_days, (critical_retention_days | int - r.age_days | int) ~ ' day(s)') }}
+          {% endfor %}
+          {% endif %}
+
+          ==================================================================
           PER SOURCE
-          ------------------------------------------------------------------
+          ==================================================================
           {% for r in deletion_results %}
           {{ r.source }}
             Snapshots found      : {{ r.found }}
             Not ours (untouched) : {{ r.unmanaged }}
-            Critical in scope    : {{ r.critical | default(0) }}
+            Critical in scope    : {{ r.critical_total | default(0) }}
             Within retention     : {{ r.retained }}
             Expired              : {{ r.expired | length }}
             Deleted              : {{ r.deleted | length }}
             Failures             : {{ r.failed | join(', ') if r.failed else 'none' }}
           {% endfor %}
-
-          ------------------------------------------------------------------
-          {{ 'SNAPSHOTS THAT WOULD BE DELETED' if dry_run | bool else 'SNAPSHOTS DELETED' }}
-          ------------------------------------------------------------------
-          {% if mail_rows | length == 0 %}
-          none
-          {% else %}
-          {{ '%-46s %-24s %6s  %s' | format('SNAPSHOT', 'RESOURCE GROUP / VM', 'AGE', 'CLASS') }}
-          {% for s in mail_rows %}
-          {{ '%-46s %-24s %5sd  %s' | format(s.name, s.resource_group | default(s.vm_name | default('-')), s.age_days, 'CRITICAL' if s.is_critical else 'ordinary') }}
-          {% endfor %}
-          {% endif %}
 
           ------------------------------------------------------------------
           Sent by delete_snapshots.yml
@@ -357,11 +398,7 @@
         secure:   "{{ smtp_secure }}"
         to:       "{{ mail_to }}"
         from:     "{{ mail_from }}"
-        subject: >-
-          {{ mail_subject_prefix }}
-          {{ 'DRY RUN — ' if dry_run | bool else '' }}{{ mail_total }} snapshot(s)
-          {{ 'would be deleted' if dry_run | bool else 'deleted' }}
-          ({{ mail_critical }} critical){{ ' — ' ~ mail_failed ~ ' FAILED' if mail_failed | int > 0 else '' }}
+        subject: "{{ (mail_subject_dryrun_prefix | default('')) if dry_run | bool else '' }}{{ mail_subject }}"
         body: "{{ mail_body }}"
       register: mail_result
       failed_when: false

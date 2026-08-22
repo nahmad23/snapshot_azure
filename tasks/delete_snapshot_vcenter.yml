@@ -145,6 +145,41 @@
     - item.skipped is not defined
     - item.failed | default(false)
 
+- name: "Build per-snapshot report rows for {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_report_rows: >-
+      {{ _vc_report_rows | default([]) + [ item.item | combine({
+           'owner_vm': item.item.vm_name,
+           'status':   ('FAILED' if item.failed | default(false) else 'DELETED'),
+           'detail':   (item.msg | default('') if item.failed | default(false) else 'removed from vCenter')
+         }) ] }}
+  loop: "{{ _vc_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when: item.skipped is not defined
+
+- name: "Build per-snapshot report rows for a dry run on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_report_rows: >-
+      {{ _vc_report_rows | default([]) + [ item | combine({
+           'owner_vm': item.vm_name,
+           'status':   'WOULD DELETE',
+           'detail':   'dry run — nothing was deleted'
+         }) ] }}
+  loop: "{{ _vc_expired_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: dry_run | bool
+
+- name: "Determine which critical snapshots are still retained on {{ current_vc_host }}"
+  ansible.builtin.set_fact:
+    _vc_critical_remaining: >-
+      {{ _vc_critical_snaps
+         | rejectattr('name', 'in', _vc_report_rows | default([])
+                                    | selectattr('status', 'equalto', 'DELETED')
+                                    | map(attribute='name') | list)
+         | list }}
+
 - name: "Append {{ current_vc_host }} results to deletion_results"
   ansible.builtin.set_fact:
     deletion_results: >-
@@ -173,7 +208,10 @@
                         | selectattr('failed', 'equalto', false)
                         | map(attribute='item')
                         | list,
-           'expired_detail': _vc_expired_snaps
+           'expired_detail': _vc_expired_snaps,
+           'report_rows':    _vc_report_rows | default([]),
+           'critical_total': _vc_critical_snaps | default([]) | length,
+           'critical_remaining': _vc_critical_remaining | default([])
          }] }}
 
 # Facts persist across include_tasks iterations, so the accumulators must be
@@ -182,6 +220,7 @@
   ansible.builtin.set_fact:
     _vc_all_snaps: []
     _vc_critical_snaps: []
+    _vc_report_rows: []
 
 - name: "{{ current_vc_host }} — deletion summary"
   ansible.builtin.debug:

@@ -80,7 +80,12 @@ mail_to:
   - nawazish.ahmad@unitedlex.com
 
 mail_from: "ansible-snapshot-retention@unitedlex.com"
-mail_subject_prefix: "[Snapshot Retention]"
+
+# Dry runs prepend "[DRY RUN] " so a preview is never mistaken for a real
+# deletion report. Set mail_subject_dryrun_prefix to "" to use the exact
+# subject in both cases.
+mail_subject: "Azure snapshot deletion report"
+mail_subject_dryrun_prefix: "[DRY RUN] "
 
 # SMTP relay. localhost:25 works when the controller runs a local MTA
 # (postfix/sendmail). Point smtp_host at your internal relay otherwise.

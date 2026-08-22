@@ -174,11 +174,23 @@ of whether `create_snapshots.yml` tagged them.
 
 ### Email summary
 
-Every run emails a summary to `mail_to` (default
-`nawazish.ahmad@unitedlex.com`) covering how many snapshots were deleted, how
-many of those were critical, the per-source breakdown, and a table of every
-snapshot removed. Dry runs are emailed too, clearly labelled and listing what
-*would* be deleted.
+Every run emails a report to `mail_to` (default
+`nawazish.ahmad@unitedlex.com`) with the subject **Azure snapshot deletion
+report**, containing:
+
+- Total snapshots deleted
+- Regular snapshots deleted (older than `retention_days`)
+- CRITICAL snapshots deleted (older than `critical_retention_days`)
+- CRITICAL snapshots **currently available** — still inside the 30-day window,
+  each with the days remaining before it becomes eligible
+- The list of servers/VMs snapshots were deleted from
+- Every snapshot name with its server, resource group, age, class and
+  deletion status, including the failure reason for anything that did not delete
+- A per-source breakdown
+
+Dry runs are emailed too, prefixed `[DRY RUN]` in the subject and listing what
+*would* be deleted. Set `mail_subject_dryrun_prefix: ""` to use the exact
+subject in both cases.
 
 The mail is sent **before** the failure gate, so a run with failed deletions
 still reports them by email. A mail failure never fails the retention run — it
@@ -189,6 +201,8 @@ is logged and the run's own exit status is preserved.
 | `send_summary_email` | `true` | Set `false` to skip the email |
 | `mail_to` | `[nawazish.ahmad@unitedlex.com]` | Recipient list |
 | `mail_from` | `ansible-snapshot-retention@unitedlex.com` | Sender address |
+| `mail_subject` | `Azure snapshot deletion report` | Email subject |
+| `mail_subject_dryrun_prefix` | `[DRY RUN] ` | Prepended to the subject on dry runs |
 | `smtp_host` / `smtp_port` | `localhost` / `25` | SMTP relay |
 | `smtp_username` / `smtp_password` | empty | Leave empty for an unauthenticated relay |
 | `smtp_secure` | `try` | `never`, `starttls`, `always` or `try` |
