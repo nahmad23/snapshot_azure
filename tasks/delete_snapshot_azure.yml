@@ -26,25 +26,55 @@
   loop: "{{ azure_rgs }}"
   loop_control:
     label: "{{ item }}"
-  register: az_snap_list
+  register: az_snap_list_rg
   ignore_errors: true
+  when: not (sweep_all_resource_groups | bool)
+
+# The CSV only names the resource groups that currently hold VMs. A snapshot
+# whose VM row was later edited or removed from the CSV would never be swept
+# again and would live forever. Sweeping the whole subscription finds those
+# too — the tag guard still decides what is ours, so the blast radius does not
+# grow, only the search does.
+- name: List all snapshots across the entire subscription
+  azure.azcollection.azure_rm_resource_info:
+    url:             "/subscriptions/{{ azure_creds.subscription_id }}/providers/Microsoft.Compute/snapshots"
+    api_version:     "{{ azure_snapshot_api_version }}"
+    subscription_id: "{{ azure_creds.subscription_id }}"
+    tenant:          "{{ azure_creds.tenant }}"
+    client_id:       "{{ azure_creds.client_id }}"
+    secret:          "{{ azure_creds.secret }}"
+  register: az_snap_list_sub
+  ignore_errors: true
+  when: sweep_all_resource_groups | bool
+
+# Both listing styles are reduced to one shape — a list of
+# {item, failed, response} — so everything downstream is written once.
+- name: Normalise the snapshot listing
+  ansible.builtin.set_fact:
+    az_listing: >-
+      {{ [{'item':     'subscription ' ~ azure_creds.subscription_id,
+           'failed':   az_snap_list_sub.failed | default(false),
+           'response': az_snap_list_sub.response | default([])}]
+         if sweep_all_resource_groups | bool
+         else az_snap_list_rg.results | default([]) }}
+  no_log: true
 
 - name: Report resource groups that could not be listed
   ansible.builtin.debug:
-    msg: "LIST FAILED for resource group '{{ item.item }}' — {{ item.msg | default('no message') }}"
-  loop: "{{ az_snap_list.results | default([]) }}"
+    msg: "LIST FAILED for '{{ item.item }}' — {{ item.msg | default('no message') }}"
+  loop: "{{ az_listing }}"
   loop_control:
     label: "{{ item.item }}"
   when: item.failed | default(false)
 
-- name: Show which resource groups were swept and how many snapshots each returned
+- name: Show which scopes were swept and how many snapshots each returned
   ansible.builtin.debug:
     msg: >-
-      RG '{{ item.item }}': {{ item.response | default([]) | length }} snapshot(s) returned
+      '{{ item.item }}': {{ item.response | default([]) | length }} snapshot(s) returned
       {%- if item.response | default([]) | length > 0 %}
       — names: {{ item.response | map(attribute='name') | list }}
       {%- endif %}
-  loop: "{{ az_snap_list.results | default([]) }}"
+  loop: "{{ az_listing }}"
   loop_control:
     label: "{{ item.item }}"
   when: not (item.failed | default(false))
@@ -57,7 +87,7 @@
       {{ item.1.name }} | tags={{ item.1.tags | default('NO TAGS KEY') }}
       | timeCreated={{ item.1.properties.timeCreated | default('NO timeCreated') }}
       | top-level keys={{ item.1.keys() | list }}
-  loop: "{{ az_snap_list.results | default([]) | subelements('response', skip_missing=True) }}"
+  loop: "{{ az_listing | subelements('response', skip_missing=True) }}"
   loop_control:
     label: "{{ item.1.name }}"
   when: debug_snapshots | default(false) | bool
@@ -71,7 +101,8 @@
   ansible.builtin.set_fact:
     az_all_snaps: >-
       {{ az_all_snaps | default([]) + [{
-           'resource_group': item.0.item,
+           'resource_group': item.1.id
+                             | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1'),
            'name':           item.1.name,
            'created':        item.1.properties.timeCreated | default(''),
            'tags':           item.1.tags | default({}, true),
@@ -82,12 +113,13 @@
                                ).days
                              )
          }] }}
-  loop: "{{ az_snap_list.results | default([]) | subelements('response', skip_missing=True) }}"
+  loop: "{{ az_listing | subelements('response', skip_missing=True) }}"
   loop_control:
     label: "{{ item.1.name }}"
   when:
     - not (item.0.failed | default(false))
     - item.1.properties.timeCreated is defined
+    - item.1.id is defined
 
 - name: Separate snapshots this playbook manages from everything else
   ansible.builtin.set_fact:
@@ -130,12 +162,19 @@
     - az_all_snaps | default([]) | length > 0
     - az_expired_snaps | length == 0
 
-- name: Warn when the resource groups swept returned nothing at all
+- name: Warn when the scopes swept returned nothing at all
   ansible.builtin.debug:
     msg:
-      - "No snapshots were returned by ANY resource group. Swept: {{ azure_rgs }}"
-      - "Confirm the snapshots live in these resource groups:"
+      - >-
+        No snapshots were returned by any scope swept:
+        {{ ('entire subscription ' ~ azure_creds.subscription_id) if sweep_all_resource_groups | bool else azure_rgs }}
+      - "Confirm where the snapshots actually live:"
       - "  az snapshot list -o table --query \"[].{name:name,rg:resourceGroup,created:timeCreated}\""
+      - >-
+        {% if not (sweep_all_resource_groups | bool) %}
+        Only resource groups named in the CSV are swept. If the snapshots sit in a
+        resource group no longer listed there, re-run with -e sweep_all_resource_groups=true
+        {% endif %}
   when: az_all_snaps | default([]) | length == 0
 
 - name: Show snapshots left alone because they are not managed by this playbook

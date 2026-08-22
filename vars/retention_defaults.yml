@@ -30,3 +30,10 @@ azure_snapshot_api_version: "2023-04-02"
 # Set true (-e debug_snapshots=true) to dump the raw snapshot data Azure
 # returned — names, tags and timeCreated — when the counts look wrong.
 debug_snapshots: false
+
+# false: sweep only the resource groups named in the CSV.
+# true : sweep every snapshot in the subscription. Needed to reach snapshots
+#        whose VM row was edited out of the CSV, which would otherwise never
+#        be swept again. The tag guard still decides what gets deleted, so
+#        this widens the search, not the blast radius.
+sweep_all_resource_groups: false
