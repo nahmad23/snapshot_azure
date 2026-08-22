@@ -26,3 +26,7 @@ snapshot_name_pattern: '^\d{8}-security-Updates$'
 
 # ARM API version used to list Microsoft.Compute/snapshots.
 azure_snapshot_api_version: "2023-04-02"
+
+# Set true (-e debug_snapshots=true) to dump the raw snapshot data Azure
+# returned — names, tags and timeCreated — when the counts look wrong.
+debug_snapshots: false

@@ -37,6 +37,31 @@
     label: "{{ item.item }}"
   when: item.failed | default(false)
 
+- name: Show which resource groups were swept and how many snapshots each returned
+  ansible.builtin.debug:
+    msg: >-
+      RG '{{ item.item }}': {{ item.response | default([]) | length }} snapshot(s) returned
+      {%- if item.response | default([]) | length > 0 %}
+      — names: {{ item.response | map(attribute='name') | list }}
+      {%- endif %}
+  loop: "{{ az_snap_list.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not (item.failed | default(false))
+
+# Shows the exact shape Azure returned, including whether tags survived the
+# round trip. Enable with -e debug_snapshots=true when the counts look wrong.
+- name: Dump the raw snapshot response for troubleshooting
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.1.name }} | tags={{ item.1.tags | default('NO TAGS KEY') }}
+      | timeCreated={{ item.1.properties.timeCreated | default('NO timeCreated') }}
+      | top-level keys={{ item.1.keys() | list }}
+  loop: "{{ az_snap_list.results | default([]) | subelements('response', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.name }}"
+  when: debug_snapshots | default(false) | bool
+
 # Flatten every snapshot across every resource group into one list, computing
 # its age up front — Jinja's selectattr cannot do arithmetic, so age_days has
 # to exist as a plain attribute before the list can be filtered on it.
@@ -85,6 +110,33 @@
       {{ az_managed_snaps | selectattr('age_days', 'ge', retention_days | int) | list }}
     az_retained_snaps: >-
       {{ az_managed_snaps | rejectattr('age_days', 'ge', retention_days | int) | list }}
+
+- name: Explain why nothing is eligible when snapshots exist but none qualify
+  ansible.builtin.debug:
+    msg:
+      - "No snapshots qualified for deletion, but {{ az_all_snaps | default([]) | length }} snapshot(s) exist. Reason:"
+      - >-
+        {% if az_managed_snaps | length == 0 %}
+        None carry the 'snapshot_name' tag, so the tag guard excluded them all.
+        Snapshots created before tagging existed, or created by another tool, look like this.
+        Check the tag with: az snapshot show -g <rg> -n <name> --query tags
+        After verifying the list is safe, re-run with -e require_snapshot_tag=false
+        {% else %}
+        {{ az_managed_snaps | length }} snapshot(s) are tagged but all are younger than
+        {{ retention_days }} day(s). Youngest age: {{ az_managed_snaps | map(attribute='age_days') | min }}d,
+        oldest: {{ az_managed_snaps | map(attribute='age_days') | max }}d.
+        {% endif %}
+  when:
+    - az_all_snaps | default([]) | length > 0
+    - az_expired_snaps | length == 0
+
+- name: Warn when the resource groups swept returned nothing at all
+  ansible.builtin.debug:
+    msg:
+      - "No snapshots were returned by ANY resource group. Swept: {{ azure_rgs }}"
+      - "Confirm the snapshots live in these resource groups:"
+      - "  az snapshot list -o table --query \"[].{name:name,rg:resourceGroup,created:timeCreated}\""
+  when: az_all_snaps | default([]) | length == 0
 
 - name: Show snapshots left alone because they are not managed by this playbook
   ansible.builtin.debug:
