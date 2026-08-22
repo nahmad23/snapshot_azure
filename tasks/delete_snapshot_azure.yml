@@ -13,29 +13,12 @@
 # through the generic ARM resource endpoint, which also returns the
 # properties.timeCreated we need for the age calculation.
 
-- name: List all snapshots in each resource group
-  azure.azcollection.azure_rm_resource_info:
-    resource_group:  "{{ item }}"
-    provider:        Microsoft.Compute
-    resource_type:   snapshots
-    api_version:     "{{ azure_snapshot_api_version }}"
-    subscription_id: "{{ azure_creds.subscription_id }}"
-    tenant:          "{{ azure_creds.tenant }}"
-    client_id:       "{{ azure_creds.client_id }}"
-    secret:          "{{ azure_creds.secret }}"
-  loop: "{{ azure_rgs }}"
-  loop_control:
-    label: "{{ item }}"
-  register: az_snap_list_rg
-  ignore_errors: true
-  when: not (sweep_all_resource_groups | bool)
-
-# The CSV only names the resource groups that currently hold VMs. A snapshot
-# whose VM row was later edited or removed from the CSV would never be swept
-# again and would live forever. Sweeping the whole subscription finds those
-# too — the tag guard still decides what is ours, so the blast radius does not
-# grow, only the search does.
-- name: List all snapshots across the entire subscription
+# Always list at subscription scope. Passing resource_group + resource_type to
+# azure_rm_resource_info returns an EMPTY response on azcollection 2.x even when
+# the resource group demonstrably holds snapshots, which silently made the
+# cleanup a no-op. The subscription URL is the form that actually works, so the
+# resource-group scoping is applied to the results below instead of to the query.
+- name: List all snapshots across the subscription
   azure.azcollection.azure_rm_resource_info:
     url:             "/subscriptions/{{ azure_creds.subscription_id }}/providers/Microsoft.Compute/snapshots"
     api_version:     "{{ azure_snapshot_api_version }}"
@@ -45,18 +28,13 @@
     secret:          "{{ azure_creds.secret }}"
   register: az_snap_list_sub
   ignore_errors: true
-  when: sweep_all_resource_groups | bool
 
-# Both listing styles are reduced to one shape — a list of
-# {item, failed, response} — so everything downstream is written once.
 - name: Normalise the snapshot listing
   ansible.builtin.set_fact:
     az_listing: >-
       {{ [{'item':     'subscription ' ~ azure_creds.subscription_id,
            'failed':   az_snap_list_sub.failed | default(false),
-           'response': az_snap_list_sub.response | default([])}]
-         if sweep_all_resource_groups | bool
-         else az_snap_list_rg.results | default([]) }}
+           'response': az_snap_list_sub.response | default([])}] }}
   no_log: true
 
 - name: Report resource groups that could not be listed
@@ -103,6 +81,9 @@
       {{ az_all_snaps | default([]) + [{
            'resource_group': item.1.id
                              | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1'),
+           'rg_lower':       item.1.id
+                             | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1')
+                             | lower,
            'name':           item.1.name,
            'created':        item.1.properties.timeCreated | default(''),
            'tags':           item.1.tags | default({}, true),
@@ -121,16 +102,43 @@
     - item.1.properties.timeCreated is defined
     - item.1.id is defined
 
+# Scoping is applied here rather than in the API query, because the per-resource
+# group query silently returns nothing (see the listing task above).
+- name: Restrict snapshots to the resource groups named in the CSV
+  ansible.builtin.set_fact:
+    az_scoped_snaps: >-
+      {{ az_all_snaps | default([])
+         if sweep_all_resource_groups | bool
+         else az_all_snaps | default([]) | selectattr('rg_lower', 'in', azure_rgs) | list }}
+
+- name: Report snapshots outside the CSV resource groups
+  ansible.builtin.debug:
+    msg: >-
+      OUT OF SCOPE ({{ az_all_snaps | default([]) | length - az_scoped_snaps | length }}
+      snapshot(s) live outside the CSV resource groups {{ azure_rgs }} and were not
+      considered). Use -e sweep_all_resource_groups=true to include them.
+  when:
+    - not (sweep_all_resource_groups | bool)
+    - az_all_snaps | default([]) | length > az_scoped_snaps | length
+
+# Lets a single snapshot be targeted for a safe end-to-end deletion test,
+# instead of running with retention_days=0 and removing everything at once.
+- name: Narrow to explicitly named snapshots when only_snapshots is set
+  ansible.builtin.set_fact:
+    az_scoped_snaps: >-
+      {{ az_scoped_snaps | selectattr('name', 'in', only_snapshots) | list }}
+  when: only_snapshots | default([]) | length > 0
+
 - name: Separate snapshots this playbook manages from everything else
   ansible.builtin.set_fact:
     az_managed_snaps: >-
-      {{ az_all_snaps | default([])
+      {{ az_scoped_snaps | default([])
          | selectattr('tags.snapshot_name', 'defined')
          | list
          if require_snapshot_tag | bool
-         else az_all_snaps | default([]) }}
+         else az_scoped_snaps | default([]) }}
     az_unmanaged_snaps: >-
-      {{ az_all_snaps | default([])
+      {{ az_scoped_snaps | default([])
          | rejectattr('tags.snapshot_name', 'defined')
          | list
          if require_snapshot_tag | bool
@@ -146,12 +154,12 @@
 - name: Explain why nothing is eligible when snapshots exist but none qualify
   ansible.builtin.debug:
     msg:
-      - "No snapshots qualified for deletion, but {{ az_all_snaps | default([]) | length }} snapshot(s) exist. Reason:"
+      - "No snapshots qualified for deletion, but {{ az_scoped_snaps | default([]) | length }} in-scope snapshot(s) exist. Reason:"
       - >-
         {% if az_managed_snaps | length == 0 %}
         None carry the 'snapshot_name' tag, so the tag guard excluded them all.
         Snapshots created before tagging existed, or created by another tool, look like this.
-        Check the tag with: az snapshot show -g <rg> -n <name> --query tags
+        Inspect tags with: ansible-playbook -i inventory.ini list_snapshots.yml --vault-password-file ~/.vault_pass
         After verifying the list is safe, re-run with -e require_snapshot_tag=false
         {% else %}
         {{ az_managed_snaps | length }} snapshot(s) are tagged but all are younger than
@@ -159,7 +167,7 @@
         oldest: {{ az_managed_snaps | map(attribute='age_days') | max }}d.
         {% endif %}
   when:
-    - az_all_snaps | default([]) | length > 0
+    - az_scoped_snaps | default([]) | length > 0
     - az_expired_snaps | length == 0
 
 - name: Warn when the scopes swept returned nothing at all
@@ -169,13 +177,13 @@
         No snapshots were returned by any scope swept:
         {{ ('entire subscription ' ~ azure_creds.subscription_id) if sweep_all_resource_groups | bool else azure_rgs }}
       - "Confirm where the snapshots actually live:"
-      - "  az snapshot list -o table --query \"[].{name:name,rg:resourceGroup,created:timeCreated}\""
+      - "  ansible-playbook -i inventory.ini list_snapshots.yml --vault-password-file ~/.vault_pass"
       - >-
         {% if not (sweep_all_resource_groups | bool) %}
         Only resource groups named in the CSV are swept. If the snapshots sit in a
         resource group no longer listed there, re-run with -e sweep_all_resource_groups=true
         {% endif %}
-  when: az_all_snaps | default([]) | length == 0
+  when: az_scoped_snaps | default([]) | length == 0
 
 - name: Show snapshots left alone because they are not managed by this playbook
   ansible.builtin.debug:
@@ -249,7 +257,7 @@
     deletion_results: >-
       {{ deletion_results + [{
            'source':    'Azure',
-           'found':     az_all_snaps | default([]) | length,
+           'found':     az_scoped_snaps | default([]) | length,
            'unmanaged': az_unmanaged_snaps | length,
            'retained':  az_retained_snaps | length,
            'expired':   az_expired_snaps | map(attribute='name') | list,
@@ -261,7 +269,7 @@
   ansible.builtin.debug:
     msg:
       - "=== Azure — retention {{ retention_days }} days ==="
-      - "  Snapshots found   : {{ az_all_snaps | default([]) | length }}"
+      - "  Snapshots found   : {{ az_scoped_snaps | default([]) | length }} in scope ({{ az_all_snaps | default([]) | length }} in subscription)"
       - "  Not ours (skipped): {{ az_unmanaged_snaps | length }}"
       - "  Within retention  : {{ az_retained_snaps | length }}"
       - "  Expired           : {{ az_expired_snaps | length }}"

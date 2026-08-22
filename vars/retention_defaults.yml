@@ -31,6 +31,12 @@ azure_snapshot_api_version: "2023-04-02"
 # returned — names, tags and timeCreated — when the counts look wrong.
 debug_snapshots: false
 
+# Limit the run to specific snapshot names. Use this to validate deletion
+# end-to-end against one snapshot instead of setting retention_days=0, which
+# would make every managed snapshot eligible at once. Example:
+#   -e '{"only_snapshots":["20260816-security-Updates-ausscsol1agt001"]}'
+only_snapshots: []
+
 # false: sweep only the resource groups named in the CSV.
 # true : sweep every snapshot in the subscription. Needed to reach snapshots
 #        whose VM row was edited out of the CSV, which would otherwise never
