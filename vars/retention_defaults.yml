@@ -10,8 +10,20 @@
 # Extra vars still win, so all of these stay overridable at runtime:
 #   -e retention_days=30 -e dry_run=true
 
-# Snapshots at or beyond this age (in days) are deleted.
+# Retention for ordinary snapshots — those whose name does NOT contain one of
+# the critical keywords below.
 retention_days: 10
+
+# Retention for snapshots whose NAME contains one of critical_name_keywords.
+# These are kept longer, then deleted like anything else.
+critical_retention_days: 30
+
+# Names containing any of these keywords get critical_retention_days instead of
+# retention_days. Matching is case-insensitive, so CRITICAL, critical, Critical
+# and CrItIcAl are all treated as critical.
+# Set to [] to apply retention_days to everything.
+critical_name_keywords:
+  - critical
 
 # Set true to report what would be deleted without deleting anything.
 dry_run: false
@@ -43,15 +55,6 @@ azure_snapshot_api_version: "2023-04-02"
 # returned — names, tags and timeCreated — when the counts look wrong.
 debug_snapshots: false
 
-# Snapshots whose NAME contains any of these keywords are never deleted, no
-# matter how old they are or which VM they belong to. Matching is
-# case-insensitive, so "CRITICAL", "critical" and "Critical" are all protected.
-# This is the last filter applied, so it overrides every selection mode
-# including snapshot_selection=all.
-# Set to [] to disable the protection entirely.
-protected_name_keywords:
-  - critical
-
 # Limit the run to specific snapshot names. Use this to validate deletion
 # end-to-end against one snapshot instead of setting retention_days=0, which
 # would make every managed snapshot eligible at once. Example:
@@ -64,3 +67,29 @@ only_snapshots: []
 #        be swept again. The tag guard still decides what gets deleted, so
 #        this widens the search, not the blast radius.
 sweep_all_resource_groups: false
+
+# ---------------------------------------------------------------------------
+# Email summary
+# ---------------------------------------------------------------------------
+# Sent after the run completes, including when deletions failed. A mail failure
+# never fails the retention run itself — it is reported and the run's own exit
+# status is preserved.
+send_summary_email: true
+
+mail_to:
+  - nawazish.ahmad@unitedlex.com
+
+mail_from: "ansible-snapshot-retention@unitedlex.com"
+mail_subject_prefix: "[Snapshot Retention]"
+
+# SMTP relay. localhost:25 works when the controller runs a local MTA
+# (postfix/sendmail). Point smtp_host at your internal relay otherwise.
+smtp_host: localhost
+smtp_port: 25
+
+# Leave empty for an unauthenticated relay.
+smtp_username: ""
+smtp_password: ""
+
+# never | starttls | always | try  (see community.general.mail)
+smtp_secure: try

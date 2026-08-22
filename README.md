@@ -147,11 +147,12 @@ untouched. `snapshot_selection=all` makes **every** snapshot in the swept
 resource groups eligible, including other teams' snapshots and base images —
 don't use it without a dry run first.
 
-**Keyword protection.** A snapshot whose *name* contains any keyword in
-`protected_name_keywords` (default `critical`) is never deleted, regardless of
-age, owning VM, or selection mode — including `snapshot_selection=all`. Matching
-is case-insensitive, so `CRITICAL`, `critical` and `Critical` are all protected.
-Set the list to `[]` to disable this.
+**Tiered retention.** A snapshot whose *name* contains any keyword in
+`critical_name_keywords` (default `critical`) is kept for
+`critical_retention_days` (**30**); everything else is kept for
+`retention_days` (**10**). Matching is case-insensitive, so `CRITICAL`,
+`critical`, `Critical` and `CrItIcAl` all get the longer window. Set the
+keyword list to `[]` to apply the ordinary window to everything.
 
 Because ownership is matched on the VM name rather than the snapshot name,
 snapshots are cleaned up regardless of their naming convention and regardless
@@ -161,14 +162,46 @@ of whether `create_snapshots.yml` tagged them.
 
 | Variable | Default | Description |
 |---|---|---|
-| `retention_days` | `10` | Age in days at which a snapshot is deleted |
+| `retention_days` | `10` | Age in days at which an ordinary snapshot is deleted |
+| `critical_retention_days` | `30` | Age in days at which a *critical* snapshot is deleted |
+| `critical_name_keywords` | `[critical]` | Names containing these get the longer window (case-insensitive) |
 | `dry_run` | `false` | `true` reports without deleting |
 | `snapshot_selection` | `csv_vms` | Azure: `csv_vms` (snapshots of CSV VMs), `tagged` (only tagged by `create_snapshots.yml`), or `all` |
 | `sweep_all_resource_groups` | `false` | `true` considers snapshots in every resource group, not just the CSV's |
 | `only_snapshots` | `[]` | Restrict the run to specific snapshot names — for testing |
-| `protected_name_keywords` | `[critical]` | Snapshot names containing any of these are never deleted (case-insensitive) |
 | `snapshot_name_pattern` | `^\d{8}-security-Updates$` | vCenter: only delete snapshots matching this regex |
 | `csv_file` | `vm_inventory.csv` | Supplies the resource groups / vCenters to sweep |
+
+### Email summary
+
+Every run emails a summary to `mail_to` (default
+`nawazish.ahmad@unitedlex.com`) covering how many snapshots were deleted, how
+many of those were critical, the per-source breakdown, and a table of every
+snapshot removed. Dry runs are emailed too, clearly labelled and listing what
+*would* be deleted.
+
+The mail is sent **before** the failure gate, so a run with failed deletions
+still reports them by email. A mail failure never fails the retention run — it
+is logged and the run's own exit status is preserved.
+
+| Variable | Default | Description |
+|---|---|---|
+| `send_summary_email` | `true` | Set `false` to skip the email |
+| `mail_to` | `[nawazish.ahmad@unitedlex.com]` | Recipient list |
+| `mail_from` | `ansible-snapshot-retention@unitedlex.com` | Sender address |
+| `smtp_host` / `smtp_port` | `localhost` / `25` | SMTP relay |
+| `smtp_username` / `smtp_password` | empty | Leave empty for an unauthenticated relay |
+| `smtp_secure` | `try` | `never`, `starttls`, `always` or `try` |
+
+**The SMTP relay must be set for your environment.** `localhost:25` only works
+if the controller runs a local MTA. Point `smtp_host` at your internal relay
+otherwise:
+
+```bash
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass \
+  -e smtp_host=smtp.unitedlex.com -e smtp_port=587
+```
 
 ### Scheduling
 

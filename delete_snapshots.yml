@@ -11,8 +11,9 @@
 #                  (see snapshot_selection in vars/retention_defaults.yml)
 #        vCenter - its name matches snapshot_name_pattern
 #                  (default: ^\d{8}-security-Updates$)
-#   3. its name does NOT contain a protected keyword (default: "critical",
-#      matched case-insensitively) — this overrides every selection mode
+#   Retention is tiered by name: a snapshot whose name contains a critical
+#   keyword (default "critical", matched case-insensitively) is kept for
+#   critical_retention_days (30); everything else for retention_days (10).
 # Snapshots taken by anyone else are listed as "not managed by this playbook"
 # and left untouched.
 #
@@ -99,12 +100,13 @@
                            | join('|') }})([^a-z0-9]|$)
       when: azure_vms | length > 0
 
-    # (?i) makes the whole alternation case-insensitive, so CRITICAL, critical
-    # and Critical are all protected. Built as a fact so every play can use it.
-    - name: Build the protected-keyword pattern
+    # (?i) makes the whole alternation case-insensitive, so CRITICAL, critical,
+    # Critical and CrItIcAl are all classed as critical. When the keyword list
+    # is empty the pattern is '(?!)', which can never match, so everything falls
+    # through to the ordinary retention window.
+    - name: Build the critical-keyword pattern
       ansible.builtin.set_fact:
-        protected_keyword_regex: "(?i)({{ protected_name_keywords | map('regex_escape') | join('|') }})"
-      when: protected_name_keywords | default([]) | length > 0
+        critical_keyword_regex: "{{ '(?i)(' ~ (critical_name_keywords | map('regex_escape') | join('|')) ~ ')' if critical_name_keywords | default([]) | length > 0 else '(?!)' }}"
 
     - name: Ensure the Azure Python SDK is usable
       ansible.builtin.include_tasks: tasks/ensure_azure_sdk.yml
@@ -121,13 +123,13 @@
           - "========================================="
           - " SNAPSHOT RETENTION CLEANUP"
           - "========================================="
-          - " Retention window : {{ retention_days }} days"
+          - " Retention window : {{ retention_days }} days (ordinary) / {{ critical_retention_days }} days (critical)"
+          - " Critical keywords: {{ (critical_name_keywords | join(', ') ~ ' — case-insensitive, kept ' ~ critical_retention_days ~ ' days') if critical_name_keywords | default([]) | length > 0 else 'none — every snapshot uses the ordinary window' }}"
           - " Mode             : {{ 'DRY RUN — nothing will be deleted' if dry_run | bool else 'DELETE' }}"
           - " Azure RGs        : {{ azure_rgs | length }}"
           - " vCenters         : {{ vcenter_hosts | length }}"
           - " Azure selection  : {{ snapshot_selection }}{{ ' — snapshots belonging to the ' ~ (azure_vms | length) ~ ' VM(s) in the CSV' if snapshot_selection == 'csv_vms' else (' — only snapshots tagged by create_snapshots.yml' if snapshot_selection == 'tagged' else ' — EVERY snapshot in scope, including other teams and base images') }}"
           - " vCenter name guard: {{ snapshot_name_pattern }}"
-          - " Protected keywords: {{ (protected_name_keywords | join(', ') ~ ' (case-insensitive, never deleted)') if protected_name_keywords | default([]) | length > 0 else 'none — keyword protection is OFF' }}"
           - "========================================="
 
     # -------------------------------------------------------------------------
@@ -233,7 +235,7 @@
           - "=== {{ item.source }} ==="
           - "  Snapshots found   : {{ item.found }}"
           - "  Not ours (skipped): {{ item.unmanaged }}"
-          - "  Keyword-protected : {{ item.protected | default(0) }}"
+          - "  Critical ({{ critical_retention_days }}d window) : {{ item.critical | default(0) }}"
           - "  Within retention  : {{ item.retained }}"
           - "  Expired           : {{ item.expired | length }}"
           - "  Deleted           : {{ item.deleted | length }}"
@@ -249,7 +251,7 @@
           - " RETENTION CLEANUP COMPLETE"
           - "========================================="
           - " Mode            : {{ 'DRY RUN — nothing deleted' if dry_run | bool else 'DELETE' }}"
-          - " Retention window: {{ retention_days }} days"
+          - " Retention window: {{ retention_days }}d ordinary / {{ critical_retention_days }}d critical"
           - " Total expired   : {{ deletion_results | map(attribute='expired') | map('length') | sum }}"
           - " Total deleted   : {{ deletion_results | map(attribute='deleted') | map('length') | sum }}"
           - " Total failed    : {{ deletion_results | map(attribute='failed')  | map('length') | sum }}"
@@ -266,6 +268,126 @@
         label: "{{ item.1 }}"
       when: deletion_results | map(attribute='failed') | map('length') | sum > 0
 
+# ---------------------------------------------------------------------------
+# Email summary — deliberately BEFORE the failure gate below, so a run with
+# failed deletions still sends the report describing those failures.
+# ---------------------------------------------------------------------------
+- name: Email the retention summary
+  hosts: localhost
+  gather_facts: true
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
+    - name: Flatten every deleted snapshot across all sources
+      ansible.builtin.set_fact:
+        mail_deleted: >-
+          {{ deletion_results | map(attribute='deleted_detail') | default([], true) | flatten }}
+        mail_expired: >-
+          {{ deletion_results | map(attribute='expired_detail') | default([], true) | flatten }}
+
+    - name: Split the reported snapshots by class
+      ansible.builtin.set_fact:
+        mail_rows: "{{ mail_expired if dry_run | bool else mail_deleted }}"
+
+    - name: Build the summary counts
+      ansible.builtin.set_fact:
+        mail_total:    "{{ mail_rows | length }}"
+        mail_critical: "{{ mail_rows | selectattr('is_critical') | list | length }}"
+        mail_ordinary: "{{ mail_rows | rejectattr('is_critical') | list | length }}"
+        mail_failed:   "{{ deletion_results | map(attribute='failed') | map('length') | sum }}"
+
+    - name: Compose the summary email
+      ansible.builtin.set_fact:
+        mail_body: |
+          Snapshot retention run on {{ ansible_hostname | default('ansible controller') }}
+          {{ '%s' | format(ansible_date_time.iso8601 | default('')) }}
+
+          MODE            : {{ 'DRY RUN — nothing was actually deleted' if dry_run | bool else 'DELETE' }}
+          Retention policy: {{ retention_days }} days ordinary, {{ critical_retention_days }} days for names containing {{ critical_name_keywords | join('/') }}
+          Servers in scope: {{ azure_vm_names_lower | default([]) | join(', ') or 'none' }}
+
+          ------------------------------------------------------------------
+          SUMMARY
+          ------------------------------------------------------------------
+          Snapshots {{ 'that would be deleted' if dry_run | bool else 'deleted' }} : {{ mail_total }}
+            of which CRITICAL ({{ critical_retention_days }}d policy)          : {{ mail_critical }}
+            of which ordinary ({{ retention_days }}d policy)                   : {{ mail_ordinary }}
+          Deletion failures                                       : {{ mail_failed }}
+
+          ------------------------------------------------------------------
+          PER SOURCE
+          ------------------------------------------------------------------
+          {% for r in deletion_results %}
+          {{ r.source }}
+            Snapshots found      : {{ r.found }}
+            Not ours (untouched) : {{ r.unmanaged }}
+            Critical in scope    : {{ r.critical | default(0) }}
+            Within retention     : {{ r.retained }}
+            Expired              : {{ r.expired | length }}
+            Deleted              : {{ r.deleted | length }}
+            Failures             : {{ r.failed | join(', ') if r.failed else 'none' }}
+          {% endfor %}
+
+          ------------------------------------------------------------------
+          {{ 'SNAPSHOTS THAT WOULD BE DELETED' if dry_run | bool else 'SNAPSHOTS DELETED' }}
+          ------------------------------------------------------------------
+          {% if mail_rows | length == 0 %}
+          none
+          {% else %}
+          {{ '%-46s %-24s %6s  %s' | format('SNAPSHOT', 'RESOURCE GROUP / VM', 'AGE', 'CLASS') }}
+          {% for s in mail_rows %}
+          {{ '%-46s %-24s %5sd  %s' | format(s.name, s.resource_group | default(s.vm_name | default('-')), s.age_days, 'CRITICAL' if s.is_critical else 'ordinary') }}
+          {% endfor %}
+          {% endif %}
+
+          ------------------------------------------------------------------
+          Sent by delete_snapshots.yml
+      when: send_summary_email | bool
+
+    # A mail failure must not mask the run's own result, so this is best-effort
+    # and the outcome is reported below.
+    - name: Send the summary email
+      community.general.mail:
+        host:     "{{ smtp_host }}"
+        port:     "{{ smtp_port }}"
+        username: "{{ smtp_username | default(omit, true) }}"
+        password: "{{ smtp_password | default(omit, true) }}"
+        secure:   "{{ smtp_secure }}"
+        to:       "{{ mail_to }}"
+        from:     "{{ mail_from }}"
+        subject: >-
+          {{ mail_subject_prefix }}
+          {{ 'DRY RUN — ' if dry_run | bool else '' }}{{ mail_total }} snapshot(s)
+          {{ 'would be deleted' if dry_run | bool else 'deleted' }}
+          ({{ mail_critical }} critical){{ ' — ' ~ mail_failed ~ ' FAILED' if mail_failed | int > 0 else '' }}
+        body: "{{ mail_body }}"
+      register: mail_result
+      failed_when: false
+      when: send_summary_email | bool
+
+    - name: Report the email outcome
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Summary emailed to ' ~ (mail_to | join(', '))
+             if not (mail_result.failed | default(false))
+             else 'EMAIL FAILED (' ~ smtp_host ~ ':' ~ smtp_port ~ ') — '
+                  ~ (mail_result.msg | default('no message'))
+                  ~ '. The retention run itself was unaffected.' }}
+      when: send_summary_email | bool
+
+# ---------------------------------------------------------------------------
+# Failure gate — last, so the email above always goes out first.
+# ---------------------------------------------------------------------------
+- name: Fail the run if any deletion failed
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
     - name: Fail playbook if any deletion failed
       ansible.builtin.fail:
         msg: >-

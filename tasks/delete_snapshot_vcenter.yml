@@ -50,6 +50,7 @@
       {{ _vc_all_snaps | default([]) + [{
            'vm_name':  item.0.item.vm_name,
            'name':     item.1.name,
+           'is_critical': (item.1.name is search(critical_keyword_regex)),
            'created':  item.1.creation_time | default(''),
            'age_days': (
                          ( now(utc=true)
@@ -74,36 +75,21 @@
     _vc_unmanaged_snaps: >-
       {{ _vc_all_snaps | default([]) | rejectattr('name', 'match', snapshot_name_pattern) | list }}
 
-# Same keyword protection as the Azure path — applied after selection so it
-# overrides the name pattern.
-- name: "Identify keyword-protected snapshots on {{ current_vc_host }}"
+# Retention is tiered by name, same as the Azure path: critical snapshots get
+# critical_retention_days, everything else gets retention_days.
+- name: "Split managed snapshots into critical and ordinary on {{ current_vc_host }}"
   ansible.builtin.set_fact:
-    _vc_protected_snaps: >-
-      {{ _vc_managed_snaps | selectattr('name', 'search', protected_keyword_regex) | list
-         if protected_name_keywords | default([]) | length > 0
-         else [] }}
+    _vc_critical_snaps: "{{ _vc_managed_snaps | selectattr('is_critical') | list }}"
+    _vc_ordinary_snaps: "{{ _vc_managed_snaps | rejectattr('is_critical') | list }}"
 
-- name: "Remove keyword-protected snapshots from the candidates on {{ current_vc_host }}"
-  ansible.builtin.set_fact:
-    _vc_managed_snaps: >-
-      {{ _vc_managed_snaps | rejectattr('name', 'search', protected_keyword_regex) | list }}
-  when: protected_name_keywords | default([]) | length > 0
-
-- name: "Show keyword-protected snapshots on {{ current_vc_host }}"
-  ansible.builtin.debug:
-    msg: >-
-      PROTECTED (name contains a protected keyword, never deleted):
-      {{ item.vm_name }} / {{ item.name }} ({{ item.age_days }}d old)
-  loop: "{{ _vc_protected_snaps }}"
-  loop_control:
-    label: "{{ item.vm_name }}/{{ item.name }}"
-
-- name: "Select snapshots past the retention window on {{ current_vc_host }}"
+- name: "Select snapshots past their own retention window on {{ current_vc_host }}"
   ansible.builtin.set_fact:
     _vc_expired_snaps: >-
-      {{ _vc_managed_snaps | selectattr('age_days', 'ge', retention_days | int) | list }}
+      {{ (_vc_critical_snaps | selectattr('age_days', 'ge', critical_retention_days | int) | list)
+         + (_vc_ordinary_snaps | selectattr('age_days', 'ge', retention_days | int) | list) }}
     _vc_retained_snaps: >-
-      {{ _vc_managed_snaps | rejectattr('age_days', 'ge', retention_days | int) | list }}
+      {{ (_vc_critical_snaps | rejectattr('age_days', 'ge', critical_retention_days | int) | list)
+         + (_vc_ordinary_snaps | rejectattr('age_days', 'ge', retention_days | int) | list) }}
 
 - name: "Show snapshots left alone on {{ current_vc_host }} (name does not match pattern)"
   ansible.builtin.debug:
@@ -165,7 +151,7 @@
       {{ deletion_results + [{
            'source':    current_vc_host,
            'found':     _vc_all_snaps | default([]) | length,
-           'protected': _vc_protected_snaps | default([]) | length,
+           'critical':  _vc_critical_snaps | default([]) | length,
            'unmanaged': _vc_unmanaged_snaps | length,
            'retained':  _vc_retained_snaps | length,
            'expired':   _vc_expired_snaps | map(attribute='name') | list,
@@ -180,7 +166,14 @@
                         | rejectattr('skipped', 'defined')
                         | selectattr('failed', 'equalto', true)
                         | map(attribute='item.name')
-                        | list
+                        | list,
+           'deleted_detail': _vc_delete_results.results
+                        | default([])
+                        | rejectattr('skipped', 'defined')
+                        | selectattr('failed', 'equalto', false)
+                        | map(attribute='item')
+                        | list,
+           'expired_detail': _vc_expired_snaps
          }] }}
 
 # Facts persist across include_tasks iterations, so the accumulators must be
@@ -188,7 +181,7 @@
 - name: "Reset per-vCenter accumulators after {{ current_vc_host }}"
   ansible.builtin.set_fact:
     _vc_all_snaps: []
-    _vc_protected_snaps: []
+    _vc_critical_snaps: []
 
 - name: "{{ current_vc_host }} — deletion summary"
   ansible.builtin.debug:
@@ -196,7 +189,7 @@
       - "=== {{ current_vc_host }} — retention {{ retention_days }} days ==="
       - "  Snapshots found   : {{ deletion_results[-1].found }}"
       - "  Not ours (skipped): {{ deletion_results[-1].unmanaged }}"
-      - "  Keyword-protected : {{ deletion_results[-1].protected }}"
+      - "  Critical (kept {{ critical_retention_days }}d) : {{ deletion_results[-1].critical }}"
       - "  Within retention  : {{ deletion_results[-1].retained }}"
       - "  Expired           : {{ deletion_results[-1].expired | length }}"
       - "  Deleted           : {{ deletion_results[-1].deleted | length }}{{ ' (dry run — none actually deleted)' if dry_run | bool else '' }}"

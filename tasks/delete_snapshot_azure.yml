@@ -86,6 +86,7 @@
                              | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1')
                              | lower,
            'name':           item.1.name,
+           'is_critical':    (item.1.name is search(critical_keyword_regex)),
            'created':        item.1.properties.timeCreated | default(''),
            'tags':           item.1.tags | default({}, true),
            'haystack':       (item.1.name
@@ -165,37 +166,32 @@
         {{ [] }}
       {%- endif -%}
 
-# Applied AFTER selection so it overrides every snapshot_selection mode,
-# including 'all'. Computed in two steps rather than one set_fact, so that
-# az_managed_snaps is never read and rewritten in the same task.
-- name: Identify snapshots protected by a keyword in their name
+# Retention is tiered by name: critical snapshots get critical_retention_days,
+# everything else gets retention_days. Each snapshot already carries is_critical
+# from the flatten step, so the two classes are filtered independently and
+# recombined.
+- name: Split managed snapshots into critical and ordinary
   ansible.builtin.set_fact:
-    az_protected_snaps: >-
-      {{ az_managed_snaps | selectattr('name', 'search', protected_keyword_regex) | list
-         if protected_name_keywords | default([]) | length > 0
-         else [] }}
+    az_critical_snaps: "{{ az_managed_snaps | selectattr('is_critical') | list }}"
+    az_ordinary_snaps: "{{ az_managed_snaps | rejectattr('is_critical') | list }}"
 
-- name: Remove keyword-protected snapshots from the deletion candidates
-  ansible.builtin.set_fact:
-    az_managed_snaps: >-
-      {{ az_managed_snaps | rejectattr('name', 'search', protected_keyword_regex) | list }}
-  when: protected_name_keywords | default([]) | length > 0
-
-- name: Show snapshots protected by a keyword in their name
-  ansible.builtin.debug:
-    msg: >-
-      PROTECTED (name contains a protected keyword, never deleted):
-      {{ item.resource_group }}/{{ item.name }} ({{ item.age_days }}d old)
-  loop: "{{ az_protected_snaps }}"
-  loop_control:
-    label: "{{ item.name }}"
-
-- name: Select snapshots past the retention window
+- name: Select snapshots past their own retention window
   ansible.builtin.set_fact:
     az_expired_snaps: >-
-      {{ az_managed_snaps | selectattr('age_days', 'ge', retention_days | int) | list }}
+      {{ (az_critical_snaps | selectattr('age_days', 'ge', critical_retention_days | int) | list)
+         + (az_ordinary_snaps | selectattr('age_days', 'ge', retention_days | int) | list) }}
     az_retained_snaps: >-
-      {{ az_managed_snaps | rejectattr('age_days', 'ge', retention_days | int) | list }}
+      {{ (az_critical_snaps | rejectattr('age_days', 'ge', critical_retention_days | int) | list)
+         + (az_ordinary_snaps | rejectattr('age_days', 'ge', retention_days | int) | list) }}
+
+- name: Show critical snapshots still inside their longer retention window
+  ansible.builtin.debug:
+    msg: >-
+      KEEP CRITICAL ({{ item.age_days }}d old, under {{ critical_retention_days }}d):
+      {{ item.resource_group }}/{{ item.name }}
+  loop: "{{ az_critical_snaps | rejectattr('age_days', 'ge', critical_retention_days | int) | list }}"
+  loop_control:
+    label: "{{ item.name }}"
 
 - name: Explain why nothing is eligible when snapshots exist but none qualify
   ansible.builtin.debug:
@@ -291,6 +287,13 @@
          | selectattr('failed', 'equalto', false)
          | map(attribute='item.name')
          | list }}
+    _az_deleted_detail: >-
+      {{ az_delete_results.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | selectattr('failed', 'equalto', false)
+         | map(attribute='item')
+         | list }}
     _az_del_failed: >-
       {{ az_delete_results.results
          | default([])
@@ -305,12 +308,14 @@
       {{ deletion_results + [{
            'source':    'Azure',
            'found':     az_scoped_snaps | default([]) | length,
-           'protected': az_protected_snaps | default([]) | length,
+           'critical':  az_critical_snaps | default([]) | length,
            'unmanaged': az_unmanaged_snaps | length,
            'retained':  az_retained_snaps | length,
            'expired':   az_expired_snaps | map(attribute='name') | list,
            'deleted':   _az_deleted,
-           'failed':    _az_del_failed
+           'failed':    _az_del_failed,
+           'deleted_detail': _az_deleted_detail,
+           'expired_detail': az_expired_snaps
          }] }}
 
 - name: Azure — deletion summary
@@ -318,7 +323,8 @@
     msg:
       - "=== Azure — retention {{ retention_days }} days ==="
       - "  Snapshots found   : {{ az_scoped_snaps | default([]) | length }} in scope ({{ az_all_snaps | default([]) | length }} in subscription)"
-      - "  Keyword-protected : {{ az_protected_snaps | default([]) | length }}"
+      - "  Critical (kept {{ critical_retention_days }}d) : {{ az_critical_snaps | default([]) | length }}"
+      - "  Ordinary (kept {{ retention_days }}d) : {{ az_ordinary_snaps | default([]) | length }}"
       - "  Not ours (skipped): {{ az_unmanaged_snaps | length }}"
       - "  Within retention  : {{ az_retained_snaps | length }}"
       - "  Expired           : {{ az_expired_snaps | length }}"
