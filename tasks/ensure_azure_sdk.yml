@@ -1,0 +1,75 @@
+---
+# tasks/ensure_azure_sdk.yml
+# Makes sure the Azure Python SDK is fully importable before any azure_rm_*
+# module runs. A single missing package makes every module fail with
+# "Failed to import the required Python library", long before Azure is reached.
+#
+# Include this from any play that talks to Azure.
+
+# azcollection 1.x ships "requirements-azure.txt"; 2.x renamed it to
+# "requirements.txt". Search both names across every collection root — the
+# path differs between galaxy installs, distro packages and pip installs.
+- name: Find Azure collection requirements file
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: >-
+      find
+      "$HOME/.ansible/collections"
+      /usr/share/ansible/collections
+      /usr/local/share/ansible/collections
+      /usr/lib/python3/dist-packages/ansible_collections
+      /usr/local/lib/python3*/dist-packages/ansible_collections
+      -maxdepth 6 -type f
+      \( -name requirements-azure.txt -o -name requirements.txt \)
+      -path '*azure/azcollection/*'
+      -print 2>/dev/null | head -n 1
+  register: az_req_file
+  changed_when: false
+
+# Best-effort: the import check below is the real gate, so a partial failure
+# here must not abort the run.
+- name: Install Azure Python SDK from collection requirements file
+  ansible.builtin.command:
+    cmd: >-
+      /usr/bin/python3 -m pip install --quiet --break-system-packages
+      -r {{ az_req_file.stdout }}
+  register: az_pip_install
+  failed_when: false
+  changed_when: true
+  when: az_req_file.stdout | default('') | length > 0
+
+# Distro-packaged deps (packaging, requests, six...) are installed by apt and
+# carry no RECORD file, so pip cannot uninstall them to upgrade and aborts with
+# "Cannot uninstall X, RECORD file not found". --ignore-installed sidesteps the
+# uninstall entirely: fresh copies land in site-packages and shadow the apt ones.
+- name: Retry SDK install ignoring distro-managed packages
+  ansible.builtin.command:
+    cmd: >-
+      /usr/bin/python3 -m pip install --quiet --break-system-packages
+      --ignore-installed -r {{ az_req_file.stdout }}
+  register: az_pip_retry
+  failed_when: false
+  changed_when: true
+  when:
+    - az_req_file.stdout | default('') | length > 0
+    - az_pip_install.rc | default(0) != 0
+
+- name: Verify the Azure SDK imports cleanly before touching Azure
+  ansible.builtin.command:
+    cmd: >-
+      /usr/bin/python3 -c
+      "import azure.mgmt.compute, azure.mgmt.dns, azure.mgmt.resource, azure.identity"
+  register: az_sdk_check
+  changed_when: false
+  failed_when: false
+
+- name: Abort early with a clear message if the Azure SDK is incomplete
+  ansible.builtin.fail:
+    msg: >-
+      Azure Python SDK is incomplete — every azure_rm_* module would fail with
+      "Failed to import the required Python library".
+      Import error: {{ az_sdk_check.stderr | default('') | trim }}
+      Fix manually with:
+      /usr/bin/python3 -m pip install --break-system-packages --ignore-installed
+      -r {{ az_req_file.stdout | default('<azcollection>/requirements.txt') }}
+  when: az_sdk_check.rc | default(0) != 0

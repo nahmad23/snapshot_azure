@@ -1,0 +1,378 @@
+---
+# tasks/delete_snapshot_azure.yml
+# Called once from delete_snapshots.yml when Azure VMs are present in the CSV.
+# Expects:
+#   azure_rgs            - unique lowercase resource group names from the CSV
+#   azure_creds          - dict {subscription_id, tenant, client_id, secret}
+#   retention_days       - snapshots at/beyond this age are deleted
+#   dry_run              - when true, report only
+#   snapshot_selection   - csv_vms | tagged | all (see vars/retention_defaults.yml)
+#   azure_vm_match_regex - VM-ownership pattern built from the CSV
+#   deletion_results     - list accumulating per-source summaries
+#
+# azcollection has no azure_rm_snapshot_info module, so snapshots are listed
+# through the generic ARM resource endpoint, which also returns the
+# properties.timeCreated we need for the age calculation.
+
+# Always list at subscription scope. Passing resource_group + resource_type to
+# azure_rm_resource_info returns an EMPTY response on azcollection 2.x even when
+# the resource group demonstrably holds snapshots, which silently made the
+# cleanup a no-op. The subscription URL is the form that actually works, so the
+# resource-group scoping is applied to the results below instead of to the query.
+- name: List all snapshots across the subscription
+  azure.azcollection.azure_rm_resource_info:
+    url:             "/subscriptions/{{ azure_creds.subscription_id }}/providers/Microsoft.Compute/snapshots"
+    api_version:     "{{ azure_snapshot_api_version }}"
+    subscription_id: "{{ azure_creds.subscription_id }}"
+    tenant:          "{{ azure_creds.tenant }}"
+    client_id:       "{{ azure_creds.client_id }}"
+    secret:          "{{ azure_creds.secret }}"
+  register: az_snap_list_sub
+  ignore_errors: true
+
+- name: Normalise the snapshot listing
+  ansible.builtin.set_fact:
+    az_listing: >-
+      {{ [{'item':     'subscription ' ~ azure_creds.subscription_id,
+           'failed':   az_snap_list_sub.failed | default(false),
+           'response': az_snap_list_sub.response | default([])}] }}
+  no_log: true
+
+- name: Report resource groups that could not be listed
+  ansible.builtin.debug:
+    msg: "LIST FAILED for '{{ item.item }}' — {{ item.msg | default('no message') }}"
+  loop: "{{ az_listing }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.failed | default(false)
+
+- name: Show which scopes were swept and how many snapshots each returned
+  ansible.builtin.debug:
+    msg: >-
+      '{{ item.item }}': {{ item.response | default([]) | length }} snapshot(s) returned
+      {%- if item.response | default([]) | length > 0 %}
+      — names: {{ item.response | map(attribute='name') | list }}
+      {%- endif %}
+  loop: "{{ az_listing }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not (item.failed | default(false))
+
+# Shows the exact shape Azure returned, including whether tags survived the
+# round trip. Enable with -e debug_snapshots=true when the counts look wrong.
+- name: Dump the raw snapshot response for troubleshooting
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.1.name }} | tags={{ item.1.tags | default('NO TAGS KEY') }}
+      | timeCreated={{ item.1.properties.timeCreated | default('NO timeCreated') }}
+      | top-level keys={{ item.1.keys() | list }}
+  loop: "{{ az_listing | subelements('response', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.name }}"
+  when: debug_snapshots | default(false) | bool
+
+# Flatten every snapshot across every resource group into one list, computing
+# its age up front — Jinja's selectattr cannot do arithmetic, so age_days has
+# to exist as a plain attribute before the list can be filtered on it.
+# timeCreated looks like "2026-08-09T10:03:31.4250530+00:00"; the first 19
+# characters are the portion to_datetime can parse.
+- name: Flatten snapshot list and compute each snapshot's age
+  ansible.builtin.set_fact:
+    az_all_snaps: >-
+      {{ az_all_snaps | default([]) + [{
+           'resource_group': item.1.id
+                             | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1'),
+           'rg_lower':       item.1.id
+                             | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1')
+                             | lower,
+           'name':           item.1.name,
+           'is_critical':    (item.1.name is search(critical_keyword_regex)),
+           'owner_vm':       ( ((item.1.tags | default({}, true)).source_vm | default(''))
+                               or (azure_vm_names_lower | default([])
+                                   | select('in', (item.1.name ~ ' '
+                                        ~ (item.1.properties.creationData.sourceResourceId | default(''))) | lower)
+                                   | list | first | default('unknown')) ),
+           'created':        item.1.properties.timeCreated | default(''),
+           'tags':           item.1.tags | default({}, true),
+           'haystack':       (item.1.name
+                              ~ ' ' ~ ((item.1.tags | default({}, true)).source_vm | default(''))
+                              ~ ' ' ~ (item.1.properties.creationData.sourceResourceId | default(''))
+                             ) | lower,
+           'age_days':       (
+                               ( now(utc=true)
+                                 - (item.1.properties.timeCreated[:19]
+                                    | to_datetime('%Y-%m-%dT%H:%M:%S'))
+                               ).days
+                             )
+         }] }}
+  loop: "{{ az_listing | subelements('response', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.name }}"
+  when:
+    - not (item.0.failed | default(false))
+    - item.1.properties.timeCreated is defined
+    - item.1.id is defined
+
+# Scoping is applied here rather than in the API query, because the per-resource
+# group query silently returns nothing (see the listing task above).
+- name: Restrict snapshots to the resource groups named in the CSV
+  ansible.builtin.set_fact:
+    az_scoped_snaps: >-
+      {{ az_all_snaps | default([])
+         if sweep_all_resource_groups | bool
+         else az_all_snaps | default([]) | selectattr('rg_lower', 'in', azure_rgs) | list }}
+
+- name: Report snapshots outside the CSV resource groups
+  ansible.builtin.debug:
+    msg: >-
+      OUT OF SCOPE ({{ az_all_snaps | default([]) | length - az_scoped_snaps | length }}
+      snapshot(s) live outside the CSV resource groups {{ azure_rgs }} and were not
+      considered). Use -e sweep_all_resource_groups=true to include them.
+  when:
+    - not (sweep_all_resource_groups | bool)
+    - az_all_snaps | default([]) | length > az_scoped_snaps | length
+
+# Lets a single snapshot be targeted for a safe end-to-end deletion test,
+# instead of running with retention_days=0 and removing everything at once.
+- name: Narrow to explicitly named snapshots when only_snapshots is set
+  ansible.builtin.set_fact:
+    az_scoped_snaps: >-
+      {{ az_scoped_snaps | selectattr('name', 'in', only_snapshots) | list }}
+  when: only_snapshots | default([]) | length > 0
+
+# Validated before use: an unrecognised value must not fall through to the
+# permissive 'all' branch below.
+- name: Abort on an unrecognised snapshot_selection value
+  ansible.builtin.fail:
+    msg: >-
+      snapshot_selection must be one of: csv_vms, tagged, all.
+      Got '{{ snapshot_selection }}'.
+  when: snapshot_selection not in ['csv_vms', 'tagged', 'all']
+
+# csv_vms claims a snapshot when the VM name appears in its name, its source_vm
+# tag, or its source disk id — so a snapshot is matched by which VM it belongs
+# to, independent of naming convention or whether it carries our tags.
+- name: Separate snapshots this playbook manages from everything else
+  ansible.builtin.set_fact:
+    az_managed_snaps: >-
+      {%- if snapshot_selection == 'csv_vms' -%}
+        {{ az_scoped_snaps | default([]) | selectattr('haystack', 'search', azure_vm_match_regex) | list }}
+      {%- elif snapshot_selection == 'tagged' -%}
+        {{ az_scoped_snaps | default([]) | selectattr('tags.snapshot_name', 'defined') | list }}
+      {%- else -%}
+        {{ az_scoped_snaps | default([]) }}
+      {%- endif -%}
+    az_unmanaged_snaps: >-
+      {%- if snapshot_selection == 'csv_vms' -%}
+        {{ az_scoped_snaps | default([]) | rejectattr('haystack', 'search', azure_vm_match_regex) | list }}
+      {%- elif snapshot_selection == 'tagged' -%}
+        {{ az_scoped_snaps | default([]) | rejectattr('tags.snapshot_name', 'defined') | list }}
+      {%- else -%}
+        {{ [] }}
+      {%- endif -%}
+
+# Retention is tiered by name: critical snapshots get critical_retention_days,
+# everything else gets retention_days. Each snapshot already carries is_critical
+# from the flatten step, so the two classes are filtered independently and
+# recombined.
+- name: Split managed snapshots into critical and ordinary
+  ansible.builtin.set_fact:
+    az_critical_snaps: "{{ az_managed_snaps | selectattr('is_critical') | list }}"
+    az_ordinary_snaps: "{{ az_managed_snaps | rejectattr('is_critical') | list }}"
+
+- name: Select snapshots past their own retention window
+  ansible.builtin.set_fact:
+    az_expired_snaps: >-
+      {{ (az_critical_snaps | selectattr('age_days', 'ge', critical_retention_days | int) | list)
+         + (az_ordinary_snaps | selectattr('age_days', 'ge', retention_days | int) | list) }}
+    az_retained_snaps: >-
+      {{ (az_critical_snaps | rejectattr('age_days', 'ge', critical_retention_days | int) | list)
+         + (az_ordinary_snaps | rejectattr('age_days', 'ge', retention_days | int) | list) }}
+
+- name: Show critical snapshots still inside their longer retention window
+  ansible.builtin.debug:
+    msg: >-
+      KEEP CRITICAL ({{ item.age_days }}d old, under {{ critical_retention_days }}d):
+      {{ item.resource_group }}/{{ item.name }}
+  loop: "{{ az_critical_snaps | rejectattr('age_days', 'ge', critical_retention_days | int) | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Explain why nothing is eligible when snapshots exist but none qualify
+  ansible.builtin.debug:
+    msg:
+      - "No snapshots qualified for deletion, but {{ az_scoped_snaps | default([]) | length }} in-scope snapshot(s) exist. Reason:"
+      - >-
+        {% if az_managed_snaps | length == 0 %}
+        None matched selection mode '{{ snapshot_selection }}'.
+        {% if snapshot_selection == 'csv_vms' %}No snapshot's name, source_vm tag or source
+        disk id contains any VM name from the CSV ({{ azure_vm_names_lower | join(', ') }}).
+        {% else %}None carry the 'snapshot_name' tag.{% endif %}
+        Inspect what exists with: ansible-playbook -i inventory.ini list_snapshots.yml --vault-password-file ~/.vault_pass
+        {% else %}
+        {{ az_managed_snaps | length }} snapshot(s) are tagged but all are younger than
+        {{ retention_days }} day(s). Youngest age: {{ az_managed_snaps | map(attribute='age_days') | min }}d,
+        oldest: {{ az_managed_snaps | map(attribute='age_days') | max }}d.
+        {% endif %}
+  when:
+    - az_scoped_snaps | default([]) | length > 0
+    - az_expired_snaps | length == 0
+
+- name: Warn when the scopes swept returned nothing at all
+  ansible.builtin.debug:
+    msg:
+      - >-
+        No snapshots were returned by any scope swept:
+        {{ ('entire subscription ' ~ azure_creds.subscription_id) if sweep_all_resource_groups | bool else azure_rgs }}
+      - "Confirm where the snapshots actually live:"
+      - "  ansible-playbook -i inventory.ini list_snapshots.yml --vault-password-file ~/.vault_pass"
+      - >-
+        {% if not (sweep_all_resource_groups | bool) %}
+        Only resource groups named in the CSV are swept. If the snapshots sit in a
+        resource group no longer listed there, re-run with -e sweep_all_resource_groups=true
+        {% endif %}
+  when: az_scoped_snaps | default([]) | length == 0
+
+- name: Show snapshots left alone because they are not managed by this playbook
+  ansible.builtin.debug:
+    msg: "NOT OURS (does not belong to any CSV VM, left untouched): {{ item.resource_group }}/{{ item.name }}"
+  loop: "{{ az_unmanaged_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Show snapshots still inside the retention window
+  ansible.builtin.debug:
+    msg: "KEEP ({{ item.age_days }}d old, under {{ retention_days }}d): {{ item.resource_group }}/{{ item.name }}"
+  loop: "{{ az_retained_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Show snapshots selected for deletion
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'WOULD DELETE' if dry_run | bool else 'DELETE' }}
+      ({{ item.age_days }}d old, created {{ item.created }}):
+      {{ item.resource_group }}/{{ item.name }}
+  loop: "{{ az_expired_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Delete expired Azure snapshots
+  azure.azcollection.azure_rm_snapshot:
+    resource_group:  "{{ item.resource_group }}"
+    name:            "{{ item.name }}"
+    state:           absent
+    subscription_id: "{{ azure_creds.subscription_id }}"
+    tenant:          "{{ azure_creds.tenant }}"
+    client_id:       "{{ azure_creds.client_id }}"
+    secret:          "{{ azure_creds.secret }}"
+  loop: "{{ az_expired_snaps }}"
+  loop_control:
+    label: "{{ item.resource_group }}/{{ item.name }}"
+  register: az_delete_results
+  ignore_errors: true
+  when: not (dry_run | bool)
+
+- name: Report why each deletion failed
+  ansible.builtin.debug:
+    msg: "DELETE FAILED: {{ item.item.resource_group }}/{{ item.item.name }} — {{ item.msg | default('no message') }}"
+  loop: "{{ az_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when:
+    - item.skipped is not defined
+    - item.failed | default(false)
+
+# One row per snapshot that reached the deletion stage, carrying its outcome.
+# Built from the delete results on a real run, and from the expired list on a
+# dry run (where the delete task is skipped and registers no results).
+- name: Build per-snapshot report rows for the run
+  ansible.builtin.set_fact:
+    az_report_rows: >-
+      {{ az_report_rows | default([]) + [ item.item | combine({
+           'status': ('FAILED' if item.failed | default(false) else 'DELETED'),
+           'detail': (item.msg | default('') if item.failed | default(false) else 'removed from Azure')
+         }) ] }}
+  loop: "{{ az_delete_results.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name | default('unknown') }}"
+  when: item.skipped is not defined
+
+- name: Build per-snapshot report rows for a dry run
+  ansible.builtin.set_fact:
+    az_report_rows: >-
+      {{ az_report_rows | default([]) + [ item | combine({
+           'status': 'WOULD DELETE',
+           'detail': 'dry run — nothing was deleted'
+         }) ] }}
+  loop: "{{ az_expired_snaps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: dry_run | bool
+
+# "Currently available" = critical snapshots that still exist after this run:
+# those inside the 30-day window, plus any whose deletion failed.
+- name: Determine which critical snapshots are still retained
+  ansible.builtin.set_fact:
+    az_critical_remaining: >-
+      {{ az_critical_snaps
+         | rejectattr('name', 'in', az_report_rows | default([])
+                                    | selectattr('status', 'equalto', 'DELETED')
+                                    | map(attribute='name') | list)
+         | list }}
+
+- name: Build Azure deletion summary
+  ansible.builtin.set_fact:
+    _az_deleted: >-
+      {{ az_delete_results.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | selectattr('failed', 'equalto', false)
+         | map(attribute='item.name')
+         | list }}
+    _az_deleted_detail: >-
+      {{ az_delete_results.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | selectattr('failed', 'equalto', false)
+         | map(attribute='item')
+         | list }}
+    _az_del_failed: >-
+      {{ az_delete_results.results
+         | default([])
+         | rejectattr('skipped', 'defined')
+         | selectattr('failed', 'equalto', true)
+         | map(attribute='item.name')
+         | list }}
+
+- name: Append Azure results to deletion_results
+  ansible.builtin.set_fact:
+    deletion_results: >-
+      {{ deletion_results + [{
+           'source':    'Azure',
+           'found':     az_scoped_snaps | default([]) | length,
+           'critical':  az_critical_snaps | default([]) | length,
+           'unmanaged': az_unmanaged_snaps | length,
+           'retained':  az_retained_snaps | length,
+           'expired':   az_expired_snaps | map(attribute='name') | list,
+           'deleted':   _az_deleted,
+           'failed':    _az_del_failed,
+           'deleted_detail': _az_deleted_detail,
+           'expired_detail': az_expired_snaps,
+           'report_rows':    az_report_rows | default([]),
+           'critical_total': az_critical_snaps | default([]) | length,
+           'critical_remaining': az_critical_remaining | default([])
+         }] }}
+
+- name: Azure — deletion summary
+  ansible.builtin.debug:
+    msg:
+      - "=== Azure — retention {{ retention_days }} days ==="
+      - "  Snapshots found   : {{ az_scoped_snaps | default([]) | length }} in scope ({{ az_all_snaps | default([]) | length }} in subscription)"
+      - "  Critical (kept {{ critical_retention_days }}d) : {{ az_critical_snaps | default([]) | length }}"
+      - "  Ordinary (kept {{ retention_days }}d) : {{ az_ordinary_snaps | default([]) | length }}"
+      - "  Not ours (skipped): {{ az_unmanaged_snaps | length }}"
+      - "  Within retention  : {{ az_retained_snaps | length }}"
+      - "  Expired           : {{ az_expired_snaps | length }}"
+      - "  Deleted           : {{ _az_deleted | length }}{{ ' (dry run — none actually deleted)' if dry_run | bool else '' }}"
+      - "  Delete failures   : {{ _az_del_failed if _az_del_failed else 'none' }}"

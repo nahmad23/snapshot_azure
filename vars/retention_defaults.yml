@@ -1,0 +1,100 @@
+---
+# vars/retention_defaults.yml
+# Defaults for delete_snapshots.yml.
+#
+# These live in a vars file rather than a play's `vars:` block because play
+# vars do NOT carry across play boundaries — only facts do. The deletion
+# playbook spans four plays, so anything referenced after play 1 has to be
+# loaded by every play via vars_files.
+#
+# Extra vars still win, so all of these stay overridable at runtime:
+#   -e retention_days=30 -e dry_run=true
+
+# Retention for ordinary snapshots — those whose name does NOT contain one of
+# the critical keywords below.
+retention_days: 10
+
+# Retention for snapshots whose NAME contains one of critical_name_keywords.
+# These are kept longer, then deleted like anything else.
+critical_retention_days: 30
+
+# Names containing any of these keywords get critical_retention_days instead of
+# retention_days. Matching is case-insensitive, so CRITICAL, critical, Critical
+# and CrItIcAl are all treated as critical.
+# Set to [] to apply retention_days to everything.
+critical_name_keywords:
+  - critical
+
+# Set true to report what would be deleted without deleting anything.
+dry_run: false
+
+# How Azure snapshots are claimed as "ours". One of:
+#
+#   csv_vms  (default) A snapshot belongs to a VM listed in the CSV. Ownership
+#            is matched on the VM name appearing in the snapshot name, in the
+#            source_vm tag, or in the source disk id — so it works no matter
+#            what naming convention the snapshot uses and whether or not it was
+#            tagged by create_snapshots.yml. Snapshots belonging to any other
+#            VM, and snapshots matching no VM at all (base images, manual
+#            backups), are never touched.
+#
+#   tagged   Only snapshots carrying the "snapshot_name" tag set by
+#            create_snapshots.yml. Stricter, but misses untagged snapshots.
+#
+#   all      EVERY snapshot in the swept resource groups. Dangerous — this
+#            deletes other teams' snapshots and base images too.
+snapshot_selection: csv_vms
+
+# vCenter: only delete snapshots whose name matches this pattern.
+snapshot_name_pattern: '^\d{8}-security-Updates$'
+
+# ARM API version used to list Microsoft.Compute/snapshots.
+azure_snapshot_api_version: "2023-04-02"
+
+# Set true (-e debug_snapshots=true) to dump the raw snapshot data Azure
+# returned — names, tags and timeCreated — when the counts look wrong.
+debug_snapshots: false
+
+# Limit the run to specific snapshot names. Use this to validate deletion
+# end-to-end against one snapshot instead of setting retention_days=0, which
+# would make every managed snapshot eligible at once. Example:
+#   -e '{"only_snapshots":["20260816-security-Updates-ausscsol1agt001"]}'
+only_snapshots: []
+
+# false: sweep only the resource groups named in the CSV.
+# true : sweep every snapshot in the subscription. Needed to reach snapshots
+#        whose VM row was edited out of the CSV, which would otherwise never
+#        be swept again. The tag guard still decides what gets deleted, so
+#        this widens the search, not the blast radius.
+sweep_all_resource_groups: false
+
+# ---------------------------------------------------------------------------
+# Email summary
+# ---------------------------------------------------------------------------
+# Sent after the run completes, including when deletions failed. A mail failure
+# never fails the retention run itself — it is reported and the run's own exit
+# status is preserved.
+send_summary_email: true
+
+mail_to:
+  - nawazish.ahmad@unitedlex.com
+
+mail_from: "ansible-snapshot-retention@unitedlex.com"
+
+# Dry runs prepend "[DRY RUN] " so a preview is never mistaken for a real
+# deletion report. Set mail_subject_dryrun_prefix to "" to use the exact
+# subject in both cases.
+mail_subject: "Azure snapshot deletion report"
+mail_subject_dryrun_prefix: "[DRY RUN] "
+
+# SMTP relay. localhost:25 works when the controller runs a local MTA
+# (postfix/sendmail). Point smtp_host at your internal relay otherwise.
+smtp_host: localhost
+smtp_port: 25
+
+# Leave empty for an unauthenticated relay.
+smtp_username: ""
+smtp_password: ""
+
+# never | starttls | always | try  (see community.general.mail)
+smtp_secure: try

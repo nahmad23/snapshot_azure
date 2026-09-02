@@ -1,0 +1,108 @@
+---
+# Playbook: list_snapshots.yml
+# Read-only audit: lists every snapshot in the subscription with its resource
+# group, creation time, age in days, tags, and whether delete_snapshots.yml
+# would consider it "ours".
+#
+# Deletes nothing. Safe to run at any time. Needs no Azure CLI — it uses the
+# same Python SDK and vault credentials as the other playbooks.
+#
+#   ansible-playbook -i inventory.ini list_snapshots.yml \
+#     --vault-password-file ~/.vault_pass
+#
+# Limit to one resource group:
+#   ... -e only_resource_group=USSC-SHARED-INFRA-RG
+
+- name: List Azure snapshots
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/azure_vault.yml
+    - vars/retention_defaults.yml
+
+  vars:
+    only_resource_group: ""
+
+  tasks:
+    - name: Ensure the Azure Python SDK is usable
+      ansible.builtin.include_tasks: tasks/ensure_azure_sdk.yml
+
+    - name: Build Azure credentials from vault
+      ansible.builtin.set_fact:
+        azure_creds:
+          subscription_id: "{{ vault_azure_subscription_id }}"
+          tenant:          "{{ vault_azure_tenant_id }}"
+          client_id:       "{{ vault_azure_client_id }}"
+          secret:          "{{ vault_azure_secret }}"
+      no_log: true
+
+    - name: List all snapshots across the subscription
+      azure.azcollection.azure_rm_resource_info:
+        url:             "/subscriptions/{{ azure_creds.subscription_id }}/providers/Microsoft.Compute/snapshots"
+        api_version:     "{{ azure_snapshot_api_version }}"
+        subscription_id: "{{ azure_creds.subscription_id }}"
+        tenant:          "{{ azure_creds.tenant }}"
+        client_id:       "{{ azure_creds.client_id }}"
+        secret:          "{{ azure_creds.secret }}"
+      register: az_all
+
+    - name: Report how many snapshots the subscription holds
+      ansible.builtin.debug:
+        msg: "Subscription returned {{ az_all.response | default([]) | length }} snapshot(s)"
+
+    - name: Show the raw response when nothing came back
+      ansible.builtin.debug:
+        var: az_all
+      when: az_all.response | default([]) | length == 0
+
+    - name: Build the snapshot table
+      ansible.builtin.set_fact:
+        snap_table: >-
+          {{ snap_table | default([]) + [{
+               'name':     item.name,
+               'rg':       item.id | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1'),
+               'created':  item.properties.timeCreated | default('unknown'),
+               'age_days': (
+                             ( now(utc=true)
+                               - (item.properties.timeCreated[:19]
+                                  | to_datetime('%Y-%m-%dT%H:%M:%S'))
+                             ).days
+                           ) if item.properties.timeCreated is defined else -1,
+               'tags':     item.tags | default({}, true),
+               'ours':     (item.tags | default({}, true)).snapshot_name is defined
+             }] }}
+      loop: "{{ az_all.response | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - item.id is defined
+        - only_resource_group | length == 0
+          or (item.id | regex_replace('^.*/[rR]esource[gG]roups/([^/]+)/.*$', '\1') | lower)
+             == (only_resource_group | lower)
+
+    - name: Snapshot inventory
+      ansible.builtin.debug:
+        msg: >-
+          {{ '%-46s' | format(item.name) }}
+          {{ '%-26s' | format(item.rg) }}
+          {{ '%4s' | format(item.age_days) }}d
+          {{ 'OURS    ' if item.ours else 'not ours' }}
+          {{ item.created }}
+      loop: "{{ snap_table | default([]) | sort(attribute='age_days', reverse=true) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " SNAPSHOT INVENTORY"
+          - "========================================="
+          - " Total snapshots      : {{ snap_table | default([]) | length }}"
+          - " Tagged as ours       : {{ snap_table | default([]) | selectattr('ours') | list | length }}"
+          - " Not ours             : {{ snap_table | default([]) | rejectattr('ours') | list | length }}"
+          - " Resource groups      : {{ snap_table | default([]) | map(attribute='rg') | unique | list }}"
+          - " Oldest (days)        : {{ (snap_table | default([]) | map(attribute='age_days') | max) if snap_table | default([]) | length > 0 else 'n/a' }}"
+          - " Would be deleted at {{ retention_days }}d : {{ snap_table | default([]) | selectattr('ours') | selectattr('age_days', 'ge', retention_days | int) | map(attribute='name') | list }}"
+          - "========================================="

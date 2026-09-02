@@ -1,0 +1,532 @@
+---
+# Playbook: delete_snapshots.yml
+# Retention cleanup for snapshots created by create_snapshots.yml.
+# Deletes any snapshot older than `retention_days` (default 10) counted from
+# the snapshot's own creation timestamp — not from its name.
+#
+# SAFETY — a snapshot is only ever deleted when BOTH hold:
+#   1. it is older than retention_days, AND
+#   2. it is recognisably ours:
+#        Azure   - belongs to a VM listed in the CSV (snapshot_selection: csv_vms)
+#                  (see snapshot_selection in vars/retention_defaults.yml)
+#        vCenter - its name matches snapshot_name_pattern
+#                  (default: ^\d{8}-security-Updates$)
+#   Retention is tiered by name: a snapshot whose name contains a critical
+#   keyword (default "critical", matched case-insensitively) is kept for
+#   critical_retention_days (30); everything else for retention_days (10).
+# Snapshots taken by anyone else are listed as "not managed by this playbook"
+# and left untouched.
+#
+# Preview without deleting anything:
+#   ansible-playbook -i inventory.ini delete_snapshots.yml \
+#     --vault-password-file ~/.vault_pass -e dry_run=true
+#
+# Normal run (deletes):
+#   ansible-playbook -i inventory.ini delete_snapshots.yml \
+#     --vault-password-file ~/.vault_pass
+#
+# Different retention window:
+#   ... -e retention_days=30
+#
+# Reads the same vm_inventory.csv as create_snapshots.yml — the CSV supplies
+# which resource groups / vCenters to sweep.
+
+- name: Load inventory and find expired snapshots
+  hosts: localhost
+  gather_facts: false
+
+  # retention_defaults.yml must be loaded by EVERY play: play vars do not cross
+  # play boundaries, and plays 2-4 reference retention_days, dry_run,
+  # snapshot_selection, snapshot_name_pattern and azure_snapshot_api_version.
+  vars_files:
+    - vars/azure_vault.yml
+    - vars/retention_defaults.yml
+
+  vars:
+    csv_file: "vm_inventory.csv"
+
+  tasks:
+    - name: Validate CSV file exists
+      ansible.builtin.stat:
+        path: "{{ csv_file }}"
+      register: csv_stat
+
+    - name: Abort if CSV file not found
+      ansible.builtin.fail:
+        msg: "CSV file '{{ csv_file }}' not found. Please check the path."
+      when: not csv_stat.stat.exists
+
+    - name: Load VM inventory from CSV
+      community.general.read_csv:
+        path: "{{ csv_file }}"
+      register: vm_csv
+
+    - name: Drop commented-out and blank rows from the CSV
+      ansible.builtin.set_fact:
+        vm_rows: >-
+          {{ vm_csv.list
+             | rejectattr('vm_name', 'match', '^\s*#')
+             | rejectattr('vm_name', 'match', '^\s*$')
+             | list }}
+
+    - name: Split VMs by platform
+      ansible.builtin.set_fact:
+        vcenter_vms_all: "{{ vm_rows | selectattr('platform', 'equalto', 'vcenter') | list }}"
+        azure_vms:       "{{ vm_rows | selectattr('platform', 'equalto', 'azure')   | list }}"
+
+    - name: Extract unique vCenter hostnames
+      ansible.builtin.set_fact:
+        vcenter_hosts: "{{ vcenter_vms_all | map(attribute='vcenter') | unique | list | sort }}"
+
+    # Azure resource group names are case-insensitive; lowercase them so the
+    # same RG spelled two ways in the CSV is swept once, not twice.
+    - name: Extract unique Azure resource groups
+      ansible.builtin.set_fact:
+        azure_rgs: >-
+          {{ azure_vms | map(attribute='resource_group') | map('lower') | unique | list | sort }}
+
+    # Ownership is matched on the VM name appearing anywhere in the snapshot's
+    # name, source_vm tag, or source disk id. The boundary groups stop
+    # "app001" from also matching a snapshot belonging to "app0011", and
+    # regex_escape keeps an unusual VM name from being read as a pattern.
+    - name: Build the VM-ownership match pattern from the CSV
+      ansible.builtin.set_fact:
+        azure_vm_names_lower: "{{ azure_vms | map(attribute='vm_name') | map('lower') | list }}"
+        azure_vm_match_regex: >-
+          (^|[^a-z0-9])({{ azure_vms
+                           | map(attribute='vm_name')
+                           | map('lower')
+                           | map('regex_escape')
+                           | join('|') }})([^a-z0-9]|$)
+      when: azure_vms | length > 0
+
+    # (?i) makes the whole alternation case-insensitive, so CRITICAL, critical,
+    # Critical and CrItIcAl are all classed as critical. When the keyword list
+    # is empty the pattern is '(?!)', which can never match, so everything falls
+    # through to the ordinary retention window.
+    - name: Build the critical-keyword pattern
+      ansible.builtin.set_fact:
+        critical_keyword_regex: "{{ '(?i)(' ~ (critical_name_keywords | map('regex_escape') | join('|')) ~ ')' if critical_name_keywords | default([]) | length > 0 else '(?!)' }}"
+
+    - name: Ensure the Azure Python SDK is usable
+      ansible.builtin.include_tasks: tasks/ensure_azure_sdk.yml
+      when: azure_vms | length > 0
+
+    - name: Initialise result accumulator
+      ansible.builtin.set_fact:
+        deletion_results: []
+        cacheable: false
+
+    - name: Show retention settings
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " SNAPSHOT RETENTION CLEANUP"
+          - "========================================="
+          - " Retention window : {{ retention_days }} days (ordinary) / {{ critical_retention_days }} days (critical)"
+          - " Critical keywords: {{ (critical_name_keywords | join(', ') ~ ' — case-insensitive, kept ' ~ critical_retention_days ~ ' days') if critical_name_keywords | default([]) | length > 0 else 'none — every snapshot uses the ordinary window' }}"
+          - " Mode             : {{ 'DRY RUN — nothing will be deleted' if dry_run | bool else 'DELETE' }}"
+          - " Azure RGs        : {{ azure_rgs | length }}"
+          - " vCenters         : {{ vcenter_hosts | length }}"
+          - " Azure selection  : {{ snapshot_selection }}{{ ' — snapshots belonging to the ' ~ (azure_vms | length) ~ ' VM(s) in the CSV' if snapshot_selection == 'csv_vms' else (' — only snapshots tagged by create_snapshots.yml' if snapshot_selection == 'tagged' else ' — EVERY snapshot in scope, including other teams and base images') }}"
+          - " vCenter name guard: {{ snapshot_name_pattern }}"
+          - "========================================="
+
+    # -------------------------------------------------------------------------
+    # vCenter credentials — prompted only when vCenter VMs are present
+    # -------------------------------------------------------------------------
+    - name: "Prompt — vCenter username (shared for all vCenters)"
+      ansible.builtin.pause:
+        prompt: "vCenter username (e.g. administrator@vsphere.local)"
+      register: vc_user_input
+      when: vcenter_vms_all | length > 0
+
+    - name: "Prompt — vCenter password"
+      ansible.builtin.pause:
+        prompt: "vCenter password (used for all vCenters)"
+        echo: false
+      register: vc_pass_input
+      no_log: true
+      when: vcenter_vms_all | length > 0
+
+    - name: Build vCenter credentials map (shared for all vCenters)
+      ansible.builtin.set_fact:
+        vcenter_creds: >-
+          {{ vcenter_creds | default({}) | combine({
+               item: {
+                 'host':     item,
+                 'user':     vc_user_input.user_input,
+                 'password': vc_pass_input.user_input
+               }
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      no_log: true
+      when: vcenter_vms_all | length > 0
+
+    - name: Build Azure credentials from vault
+      ansible.builtin.set_fact:
+        azure_creds:
+          subscription_id: "{{ vault_azure_subscription_id }}"
+          tenant:          "{{ vault_azure_tenant_id }}"
+          client_id:       "{{ vault_azure_client_id }}"
+          secret:          "{{ vault_azure_secret }}"
+      no_log: true
+      when: azure_vms | length > 0
+
+    - name: Build VMs-by-vCenter map
+      ansible.builtin.set_fact:
+        vms_by_vcenter: >-
+          {{ vms_by_vcenter | default({}) | combine({
+               item: vcenter_vms_all | selectattr('vcenter', 'equalto', item) | list
+             }) }}
+      loop: "{{ vcenter_hosts }}"
+      when: vcenter_vms_all | length > 0
+
+# ---------------------------------------------------------------------------
+# Azure snapshot cleanup
+# ---------------------------------------------------------------------------
+- name: Delete expired Azure snapshots
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
+    - name: Process Azure snapshot retention
+      ansible.builtin.include_tasks: tasks/delete_snapshot_azure.yml
+      when: azure_vms | default([]) | length > 0
+
+# ---------------------------------------------------------------------------
+# vCenter snapshot cleanup
+# ---------------------------------------------------------------------------
+- name: Delete expired vCenter snapshots
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
+    - name: Process vCenter snapshot retention
+      ansible.builtin.include_tasks: tasks/delete_snapshot_vcenter.yml
+      loop: "{{ vcenter_hosts | default([]) }}"
+      loop_control:
+        loop_var: current_vc_host
+        label: "{{ current_vc_host }}"
+      when: vcenter_hosts | default([]) | length > 0
+
+# ---------------------------------------------------------------------------
+# Combined final report
+# ---------------------------------------------------------------------------
+- name: Final combined report
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
+    - name: Per-source deletion results
+      ansible.builtin.debug:
+        msg:
+          - "=== {{ item.source }} ==="
+          - "  Snapshots found   : {{ item.found }}"
+          - "  Not ours (skipped): {{ item.unmanaged }}"
+          - "  Critical ({{ critical_retention_days }}d window) : {{ item.critical | default(0) }}"
+          - "  Within retention  : {{ item.retained }}"
+          - "  Expired           : {{ item.expired | length }}"
+          - "  Deleted           : {{ item.deleted | length }}"
+          - "  Delete failures   : {{ item.failed if item.failed else 'none' }}"
+      loop: "{{ deletion_results }}"
+      loop_control:
+        label: "{{ item.source }}"
+
+    - name: Overall retention report
+      ansible.builtin.debug:
+        msg:
+          - "========================================="
+          - " RETENTION CLEANUP COMPLETE"
+          - "========================================="
+          - " Mode            : {{ 'DRY RUN — nothing deleted' if dry_run | bool else 'DELETE' }}"
+          - " Retention window: {{ retention_days }}d ordinary / {{ critical_retention_days }}d critical"
+          - " Total expired   : {{ deletion_results | map(attribute='expired') | map('length') | sum }}"
+          - " Total deleted   : {{ deletion_results | map(attribute='deleted') | map('length') | sum }}"
+          - " Total failed    : {{ deletion_results | map(attribute='failed')  | map('length') | sum }}"
+          - "========================================="
+
+    - name: List all failed deletions
+      ansible.builtin.debug:
+        msg: "DELETE FAILED on {{ item.0.source }}: {{ item.1 }}"
+      loop: >-
+        {{ deletion_results
+           | selectattr('failed', 'ne', [])
+           | subelements('failed') }}
+      loop_control:
+        label: "{{ item.1 }}"
+      when: deletion_results | map(attribute='failed') | map('length') | sum > 0
+
+# ---------------------------------------------------------------------------
+# Email summary — deliberately BEFORE the failure gate below, so a run with
+# failed deletions still sends the report describing those failures.
+# ---------------------------------------------------------------------------
+- name: Email the retention summary
+  hosts: localhost
+  gather_facts: true
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
+    - name: Gather the per-snapshot rows and critical inventory
+      ansible.builtin.set_fact:
+        mail_rows: >-
+          {{ deletion_results | map(attribute='report_rows') | default([], true) | flatten }}
+        mail_critical_remaining: >-
+          {{ deletion_results | map(attribute='critical_remaining') | default([], true) | flatten }}
+        mail_critical_total: >-
+          {{ deletion_results | map(attribute='critical_total') | default([], true) | sum }}
+
+    # Only rows that actually went (or would go) are counted as deleted;
+    # FAILED rows are reported separately so the totals stay honest.
+    - name: Build the summary counts
+      ansible.builtin.set_fact:
+        mail_gone: >-
+          {{ mail_rows | rejectattr('status', 'equalto', 'FAILED') | list }}
+        mail_failed_rows: >-
+          {{ mail_rows | selectattr('status', 'equalto', 'FAILED') | list }}
+
+    - name: Derive the headline numbers
+      ansible.builtin.set_fact:
+        mail_total:       "{{ mail_gone | length }}"
+        mail_crit_gone:   "{{ mail_gone | selectattr('is_critical') | list | length }}"
+        mail_ord_gone:    "{{ mail_gone | rejectattr('is_critical') | list | length }}"
+        mail_servers:     "{{ mail_gone | map(attribute='owner_vm') | map('lower') | unique | sort | list }}"
+        mail_failed:      "{{ mail_failed_rows | length }}"
+
+    # Sent as HTML: a plain-text body loses its column alignment in most mail
+    # clients, and Outlook strips what it calls "extra line breaks", which
+    # collapses the tables into an unreadable block. Styles are inline because
+    # mail clients routinely drop <style> blocks.
+    - name: Compose the summary email
+      ansible.builtin.set_fact:
+        mail_body: |
+          <html><body style="margin:0;padding:0;background:#eef1f4;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f4;padding:20px 10px;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+          <tr><td align="center">
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:960px;background:#ffffff;border:1px solid #d5dbe1;border-radius:6px;overflow:hidden;">
+
+          <tr><td style="background:{{ '#8a6d1f' if dry_run | bool else '#1f4e79' }};padding:18px 22px;">
+            <div style="font-size:19px;font-weight:600;color:#ffffff;">Azure snapshot deletion report</div>
+            <div style="font-size:13px;color:#dce6f1;padding-top:4px;">
+              {{ 'DRY RUN - nothing was actually deleted' if dry_run | bool else 'Deletion run completed' }}
+              &nbsp;|&nbsp; {{ ansible_hostname | default('ansible controller') }}
+              &nbsp;|&nbsp; {{ ansible_date_time.iso8601 | default('') }}
+            </div>
+          </td></tr>
+
+          <tr><td style="padding:18px 22px 6px 22px;">
+            <div style="font-size:12px;color:#5a6672;padding-bottom:10px;">
+              Retention policy: <b>{{ retention_days }} days</b> for regular snapshots,
+              <b>{{ critical_retention_days }} days</b> for names containing
+              <b>{{ critical_name_keywords | join('/') | upper }}</b> (case-insensitive).
+              Servers in scope: {{ azure_vm_names_lower | default([]) | join(', ') or 'none' }}
+            </div>
+
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="8" style="border-collapse:separate;">
+            <tr>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:#1f4e79;">{{ mail_total }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Total {{ 'to delete' if dry_run | bool else 'deleted' }}</div>
+              </td>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:#2f6f3e;">{{ mail_ord_gone }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Regular &gt; {{ retention_days }}d</div>
+              </td>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:#8a3b1f;">{{ mail_crit_gone }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Critical &gt; {{ critical_retention_days }}d</div>
+              </td>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:{{ '#a01b1b' if mail_failed | int > 0 else '#5a6672' }};">{{ mail_failed }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Failures</div>
+              </td>
+            </tr>
+            </table>
+
+            <div style="margin:10px 0 0 0;padding:10px 12px;background:#fff8e6;border:1px solid #e8d9a8;border-radius:5px;font-size:13px;color:#5d4a12;">
+              <b>{{ mail_critical_remaining | length }}</b> CRITICAL snapshot(s) currently available
+              (of {{ mail_critical_total }} seen this run) - still inside the {{ critical_retention_days }}-day window.
+            </div>
+          </td></tr>
+
+          <tr><td style="padding:14px 22px 4px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">
+              Servers / VMs snapshots were deleted from ({{ mail_servers | length }})
+            </div>
+            <div style="font-size:13px;color:#333c45;">
+            {% if mail_servers | length == 0 %}
+              none
+            {% else %}
+              {% for v in mail_servers %}
+              <span style="display:inline-block;background:#eaf0f6;border:1px solid #ccd7e2;border-radius:12px;padding:3px 10px;margin:0 4px 4px 0;font-family:Consolas,monospace;font-size:12px;">{{ v }}</span>
+              {% endfor %}
+            {% endif %}
+            </div>
+          </td></tr>
+
+          <tr><td style="padding:16px 22px 4px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">
+              {{ 'Snapshots that would be deleted' if dry_run | bool else 'Snapshots deleted' }} ({{ mail_rows | length }})
+            </div>
+            {% if mail_rows | length == 0 %}
+            <div style="font-size:13px;color:#5a6672;">none</div>
+            {% else %}
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+              <tr style="background:#f0f3f6;">
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Snapshot name</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Server / VM</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Resource group</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Age</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Class</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Status</th>
+              </tr>
+              {% for r in mail_rows | sort(attribute='name') %}
+              <tr style="background:{{ '#ffffff' if loop.index is odd else '#fafbfc' }};">
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.name }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.owner_vm | default('-') }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.resource_group | default('-') }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.age_days }}d</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">
+                  {% if r.is_critical %}<span style="background:#fdeaea;color:#8a3b1f;border:1px solid #f0c9c9;border-radius:3px;padding:1px 6px;font-weight:600;">CRITICAL</span>
+                  {% else %}<span style="color:#5a6672;">regular</span>{% endif %}
+                </td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">
+                  {% if r.status == 'FAILED' %}<span style="color:#a01b1b;font-weight:600;">FAILED</span>
+                  {% elif r.status == 'DELETED' %}<span style="color:#2f6f3e;font-weight:600;">DELETED</span>
+                  {% else %}<span style="color:#8a6d1f;font-weight:600;">{{ r.status }}</span>{% endif %}
+                </td>
+              </tr>
+              {% if r.status == 'FAILED' %}
+              <tr><td colspan="6" style="padding:4px 8px 8px 8px;border-bottom:1px solid #e6eaee;background:#fff5f5;color:#8a2b2b;font-size:12px;">reason: {{ r.detail }}</td></tr>
+              {% endif %}
+              {% endfor %}
+            </table>
+            {% endif %}
+          </td></tr>
+
+          <tr><td style="padding:16px 22px 4px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">
+              CRITICAL snapshots retained - not yet {{ critical_retention_days }} days old ({{ mail_critical_remaining | length }})
+            </div>
+            {% if mail_critical_remaining | length == 0 %}
+            <div style="font-size:13px;color:#5a6672;">none</div>
+            {% else %}
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+              <tr style="background:#f0f3f6;">
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Snapshot name</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Server / VM</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Resource group</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Age</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Deletes in</th>
+              </tr>
+              {% for r in mail_critical_remaining | sort(attribute='age_days', reverse=true) %}
+              <tr style="background:{{ '#ffffff' if loop.index is odd else '#fafbfc' }};">
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.name }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.owner_vm | default(r.vm_name | default('-')) }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.resource_group | default('-') }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.age_days }}d</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-weight:600;color:#5d4a12;">{{ critical_retention_days | int - r.age_days | int }} day(s)</td>
+              </tr>
+              {% endfor %}
+            </table>
+            {% endif %}
+          </td></tr>
+
+          <tr><td style="padding:16px 22px 18px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">Per source</div>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+              <tr style="background:#f0f3f6;">
+                <th align="left"  style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Source</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Found</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Not ours</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Critical</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Retained</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Expired</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Deleted</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Failed</th>
+              </tr>
+              {% for r in deletion_results %}
+              <tr>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-weight:600;">{{ r.source }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.found }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.unmanaged }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.critical_total | default(0) }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.retained }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.expired | length }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.deleted | length }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;color:{{ '#a01b1b' if r.failed | length > 0 else '#5a6672' }};">{{ r.failed | length }}</td>
+              </tr>
+              {% endfor %}
+            </table>
+          </td></tr>
+
+          <tr><td style="padding:12px 22px;background:#f7f9fb;border-top:1px solid #e2e8ee;font-size:11px;color:#78838f;">
+            Generated by delete_snapshots.yml on {{ ansible_hostname | default('ansible controller') }}.
+            This is an automated message.
+          </td></tr>
+
+          </table>
+          </td></tr>
+          </table>
+          </body></html>
+      when: send_summary_email | bool
+
+    # A mail failure must not mask the run's own result, so this is best-effort
+    # and the outcome is reported below.
+    - name: Send the summary email
+      community.general.mail:
+        host:     "{{ smtp_host }}"
+        port:     "{{ smtp_port }}"
+        username: "{{ smtp_username | default(omit, true) }}"
+        password: "{{ smtp_password | default(omit, true) }}"
+        secure:   "{{ smtp_secure }}"
+        to:       "{{ mail_to }}"
+        from:     "{{ mail_from }}"
+        subject: "{{ (mail_subject_dryrun_prefix | default('')) if dry_run | bool else '' }}{{ mail_subject }}"
+        body: "{{ mail_body }}"
+        subtype: html
+        charset: utf-8
+      register: mail_result
+      failed_when: false
+      when: send_summary_email | bool
+
+    - name: Report the email outcome
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Summary emailed to ' ~ (mail_to | join(', '))
+             if not (mail_result.failed | default(false))
+             else 'EMAIL FAILED (' ~ smtp_host ~ ':' ~ smtp_port ~ ') — '
+                  ~ (mail_result.msg | default('no message'))
+                  ~ '. The retention run itself was unaffected.' }}
+      when: send_summary_email | bool
+
+# ---------------------------------------------------------------------------
+# Failure gate — last, so the email above always goes out first.
+# ---------------------------------------------------------------------------
+- name: Fail the run if any deletion failed
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/retention_defaults.yml
+
+  tasks:
+    - name: Fail playbook if any deletion failed
+      ansible.builtin.fail:
+        msg: >-
+          {{ deletion_results | map(attribute='failed') | map('length') | sum }}
+          snapshot(s) failed to delete. See list above.
+      when: deletion_results | map(attribute='failed') | map('length') | sum > 0

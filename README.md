@@ -112,6 +112,127 @@ PLAY 4 — Final report
   └─ Exit non-zero if any failed
 ```
 
+## Snapshot retention / deletion (`delete_snapshots.yml`)
+
+Deletes snapshots older than `retention_days` (default **10**), counted from the
+snapshot's own creation timestamp in Azure/vCenter — not from its name, so
+renamed or manually created snapshots are still aged correctly.
+
+```bash
+# Preview only — lists what would be deleted, deletes nothing
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass -e dry_run=true
+
+# Real run
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass
+
+# Different retention window
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass -e retention_days=30
+```
+
+### Safety
+
+A snapshot is deleted only when **both** conditions hold: it is at or beyond
+the retention age, **and** it is recognisably created by this playbook.
+
+| Platform | "Ours" test | Override |
+|---|---|---|
+| Azure | Belongs to a VM listed in the CSV — matched on the VM name in the snapshot name, the `source_vm` tag, or the source disk id | `-e snapshot_selection=tagged` or `=all` |
+| vCenter | Name matches `^\d{8}-security-Updates$` | `-e snapshot_name_pattern='...'` |
+
+Anything else in the same resource group is reported as `NOT OURS` and left
+untouched. `snapshot_selection=all` makes **every** snapshot in the swept
+resource groups eligible, including other teams' snapshots and base images —
+don't use it without a dry run first.
+
+**Tiered retention.** A snapshot whose *name* contains any keyword in
+`critical_name_keywords` (default `critical`) is kept for
+`critical_retention_days` (**30**); everything else is kept for
+`retention_days` (**10**). Matching is case-insensitive, so `CRITICAL`,
+`critical`, `Critical` and `CrItIcAl` all get the longer window. Set the
+keyword list to `[]` to apply the ordinary window to everything.
+
+Because ownership is matched on the VM name rather than the snapshot name,
+snapshots are cleaned up regardless of their naming convention and regardless
+of whether `create_snapshots.yml` tagged them.
+
+### Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `retention_days` | `10` | Age in days at which an ordinary snapshot is deleted |
+| `critical_retention_days` | `30` | Age in days at which a *critical* snapshot is deleted |
+| `critical_name_keywords` | `[critical]` | Names containing these get the longer window (case-insensitive) |
+| `dry_run` | `false` | `true` reports without deleting |
+| `snapshot_selection` | `csv_vms` | Azure: `csv_vms` (snapshots of CSV VMs), `tagged` (only tagged by `create_snapshots.yml`), or `all` |
+| `sweep_all_resource_groups` | `false` | `true` considers snapshots in every resource group, not just the CSV's |
+| `only_snapshots` | `[]` | Restrict the run to specific snapshot names — for testing |
+| `snapshot_name_pattern` | `^\d{8}-security-Updates$` | vCenter: only delete snapshots matching this regex |
+| `csv_file` | `vm_inventory.csv` | Supplies the resource groups / vCenters to sweep |
+
+### Email summary
+
+Every run emails a report to `mail_to` (default
+`nawazish.ahmad@unitedlex.com`) with the subject **Azure snapshot deletion
+report**, containing:
+
+- Total snapshots deleted
+- Regular snapshots deleted (older than `retention_days`)
+- CRITICAL snapshots deleted (older than `critical_retention_days`)
+- CRITICAL snapshots **currently available** — still inside the 30-day window,
+  each with the days remaining before it becomes eligible
+- The list of servers/VMs snapshots were deleted from
+- Every snapshot name with its server, resource group, age, class and
+  deletion status, including the failure reason for anything that did not delete
+- A per-source breakdown
+
+Dry runs are emailed too, prefixed `[DRY RUN]` in the subject and listing what
+*would* be deleted. Set `mail_subject_dryrun_prefix: ""` to use the exact
+subject in both cases.
+
+The report is sent as **HTML** with inline styles. A plain-text body loses its
+column alignment in most mail clients, and Outlook strips what it calls "extra
+line breaks", which collapses tabular output into an unreadable block.
+
+The mail is sent **before** the failure gate, so a run with failed deletions
+still reports them by email. A mail failure never fails the retention run — it
+is logged and the run's own exit status is preserved.
+
+| Variable | Default | Description |
+|---|---|---|
+| `send_summary_email` | `true` | Set `false` to skip the email |
+| `mail_to` | `[nawazish.ahmad@unitedlex.com]` | Recipient list |
+| `mail_from` | `ansible-snapshot-retention@unitedlex.com` | Sender address |
+| `mail_subject` | `Azure snapshot deletion report` | Email subject |
+| `mail_subject_dryrun_prefix` | `[DRY RUN] ` | Prepended to the subject on dry runs |
+| `smtp_host` / `smtp_port` | `localhost` / `25` | SMTP relay |
+| `smtp_username` / `smtp_password` | empty | Leave empty for an unauthenticated relay |
+| `smtp_secure` | `try` | `never`, `starttls`, `always` or `try` |
+
+**The SMTP relay must be set for your environment.** `localhost:25` only works
+if the controller runs a local MTA. Point `smtp_host` at your internal relay
+otherwise:
+
+```bash
+ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass \
+  -e smtp_host=smtp.unitedlex.com -e smtp_port=587
+```
+
+### Scheduling
+
+Runs unattended with no prompts as long as the CSV is Azure-only:
+
+```cron
+30 2 * * * cd /data/ansible/snapshot/snapshot_new/snapshot_azure && \
+  ansible-playbook -i inventory.ini delete_snapshots.yml \
+  --vault-password-file ~/.vault_pass >> /var/log/snapshot_cleanup.log 2>&1
+```
+
+The playbook exits non-zero if any deletion fails, so cron/AWX will flag it.
+
 ## Tuning
 
 **Batch size** (`batch_size` in `create_snapshots.yml`, default `10`):
