@@ -192,6 +192,10 @@ Dry runs are emailed too, prefixed `[DRY RUN]` in the subject and listing what
 *would* be deleted. Set `mail_subject_dryrun_prefix: ""` to use the exact
 subject in both cases.
 
+The report is sent as **HTML** with inline styles. A plain-text body loses its
+column alignment in most mail clients, and Outlook strips what it calls "extra
+line breaks", which collapses tabular output into an unreadable block.
+
 The mail is sent **before** the failure gate, so a run with failed deletions
 still reports them by email. A mail failure never fails the retention run — it
 is logged and the run's own exit status is preserved.

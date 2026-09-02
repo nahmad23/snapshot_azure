@@ -306,85 +306,182 @@
         mail_servers:     "{{ mail_gone | map(attribute='owner_vm') | map('lower') | unique | sort | list }}"
         mail_failed:      "{{ mail_failed_rows | length }}"
 
+    # Sent as HTML: a plain-text body loses its column alignment in most mail
+    # clients, and Outlook strips what it calls "extra line breaks", which
+    # collapses the tables into an unreadable block. Styles are inline because
+    # mail clients routinely drop <style> blocks.
     - name: Compose the summary email
       ansible.builtin.set_fact:
         mail_body: |
-          Azure snapshot deletion report
-          Run on {{ ansible_hostname | default('ansible controller') }} at {{ ansible_date_time.iso8601 | default('unknown time') }}
+          <html><body style="margin:0;padding:0;background:#eef1f4;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef1f4;padding:20px 10px;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+          <tr><td align="center">
+          <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:960px;background:#ffffff;border:1px solid #d5dbe1;border-radius:6px;overflow:hidden;">
 
-          MODE             : {{ 'DRY RUN — nothing was actually deleted' if dry_run | bool else 'DELETE' }}
-          Retention policy : {{ retention_days }} days for regular snapshots
-                             {{ critical_retention_days }} days for names containing {{ critical_name_keywords | join('/') | upper }} (case-insensitive)
-          Servers in scope : {{ azure_vm_names_lower | default([]) | join(', ') or 'none' }}
+          <tr><td style="background:{{ '#8a6d1f' if dry_run | bool else '#1f4e79' }};padding:18px 22px;">
+            <div style="font-size:19px;font-weight:600;color:#ffffff;">Azure snapshot deletion report</div>
+            <div style="font-size:13px;color:#dce6f1;padding-top:4px;">
+              {{ 'DRY RUN - nothing was actually deleted' if dry_run | bool else 'Deletion run completed' }}
+              &nbsp;|&nbsp; {{ ansible_hostname | default('ansible controller') }}
+              &nbsp;|&nbsp; {{ ansible_date_time.iso8601 | default('') }}
+            </div>
+          </td></tr>
 
-          ==================================================================
-          SUMMARY
-          ==================================================================
-          Total snapshots {{ 'that would be deleted' if dry_run | bool else 'deleted' }}      : {{ mail_total }}
-            Regular snapshots deleted (> {{ retention_days }} days)   : {{ mail_ord_gone }}
-            CRITICAL snapshots deleted (> {{ critical_retention_days }} days)  : {{ mail_crit_gone }}
+          <tr><td style="padding:18px 22px 6px 22px;">
+            <div style="font-size:12px;color:#5a6672;padding-bottom:10px;">
+              Retention policy: <b>{{ retention_days }} days</b> for regular snapshots,
+              <b>{{ critical_retention_days }} days</b> for names containing
+              <b>{{ critical_name_keywords | join('/') | upper }}</b> (case-insensitive).
+              Servers in scope: {{ azure_vm_names_lower | default([]) | join(', ') or 'none' }}
+            </div>
 
-          CRITICAL snapshots currently available     : {{ mail_critical_remaining | length }}
-            (of {{ mail_critical_total }} critical snapshot(s) seen this run — still inside the {{ critical_retention_days }}-day window)
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="8" style="border-collapse:separate;">
+            <tr>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:#1f4e79;">{{ mail_total }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Total {{ 'to delete' if dry_run | bool else 'deleted' }}</div>
+              </td>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:#2f6f3e;">{{ mail_ord_gone }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Regular &gt; {{ retention_days }}d</div>
+              </td>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:#8a3b1f;">{{ mail_crit_gone }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Critical &gt; {{ critical_retention_days }}d</div>
+              </td>
+              <td width="25%" align="center" style="background:#f4f7fa;border:1px solid #dbe3ea;border-radius:5px;padding:12px 6px;">
+                <div style="font-size:26px;font-weight:700;color:{{ '#a01b1b' if mail_failed | int > 0 else '#5a6672' }};">{{ mail_failed }}</div>
+                <div style="font-size:11px;color:#5a6672;text-transform:uppercase;letter-spacing:.4px;">Failures</div>
+              </td>
+            </tr>
+            </table>
 
-          Deletion failures                          : {{ mail_failed }}
+            <div style="margin:10px 0 0 0;padding:10px 12px;background:#fff8e6;border:1px solid #e8d9a8;border-radius:5px;font-size:13px;color:#5d4a12;">
+              <b>{{ mail_critical_remaining | length }}</b> CRITICAL snapshot(s) currently available
+              (of {{ mail_critical_total }} seen this run) - still inside the {{ critical_retention_days }}-day window.
+            </div>
+          </td></tr>
 
-          ==================================================================
-          SERVERS / VMs SNAPSHOTS WERE DELETED FROM ({{ mail_servers | length }})
-          ==================================================================
-          {% if mail_servers | length == 0 %}
-          none
-          {% else %}
-          {% for v in mail_servers %}
-            - {{ v }}
-          {% endfor %}
-          {% endif %}
+          <tr><td style="padding:14px 22px 4px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">
+              Servers / VMs snapshots were deleted from ({{ mail_servers | length }})
+            </div>
+            <div style="font-size:13px;color:#333c45;">
+            {% if mail_servers | length == 0 %}
+              none
+            {% else %}
+              {% for v in mail_servers %}
+              <span style="display:inline-block;background:#eaf0f6;border:1px solid #ccd7e2;border-radius:12px;padding:3px 10px;margin:0 4px 4px 0;font-family:Consolas,monospace;font-size:12px;">{{ v }}</span>
+              {% endfor %}
+            {% endif %}
+            </div>
+          </td></tr>
 
-          ==================================================================
-          {{ 'SNAPSHOTS THAT WOULD BE DELETED' if dry_run | bool else 'SNAPSHOTS DELETED' }} ({{ mail_rows | length }})
-          ==================================================================
-          {% if mail_rows | length == 0 %}
-          none
-          {% else %}
-          {{ '%-48s %-22s %-20s %6s %-14s %s' | format('SNAPSHOT NAME', 'SERVER / VM', 'RESOURCE GROUP', 'AGE', 'CLASS', 'STATUS') }}
-          {{ '-' * 130 }}
-          {% for r in mail_rows | sort(attribute='name') %}
-          {{ '%-48s %-22s %-20s %5sd %-14s %s' | format(r.name, r.owner_vm | default('-'), r.resource_group | default('-'), r.age_days, ('CRITICAL' if r.is_critical else 'regular'), r.status) }}
-          {% if r.status == 'FAILED' %}
-                 reason: {{ r.detail }}
-          {% endif %}
-          {% endfor %}
-          {% endif %}
+          <tr><td style="padding:16px 22px 4px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">
+              {{ 'Snapshots that would be deleted' if dry_run | bool else 'Snapshots deleted' }} ({{ mail_rows | length }})
+            </div>
+            {% if mail_rows | length == 0 %}
+            <div style="font-size:13px;color:#5a6672;">none</div>
+            {% else %}
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+              <tr style="background:#f0f3f6;">
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Snapshot name</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Server / VM</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Resource group</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Age</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Class</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Status</th>
+              </tr>
+              {% for r in mail_rows | sort(attribute='name') %}
+              <tr style="background:{{ '#ffffff' if loop.index is odd else '#fafbfc' }};">
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.name }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.owner_vm | default('-') }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.resource_group | default('-') }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.age_days }}d</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">
+                  {% if r.is_critical %}<span style="background:#fdeaea;color:#8a3b1f;border:1px solid #f0c9c9;border-radius:3px;padding:1px 6px;font-weight:600;">CRITICAL</span>
+                  {% else %}<span style="color:#5a6672;">regular</span>{% endif %}
+                </td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">
+                  {% if r.status == 'FAILED' %}<span style="color:#a01b1b;font-weight:600;">FAILED</span>
+                  {% elif r.status == 'DELETED' %}<span style="color:#2f6f3e;font-weight:600;">DELETED</span>
+                  {% else %}<span style="color:#8a6d1f;font-weight:600;">{{ r.status }}</span>{% endif %}
+                </td>
+              </tr>
+              {% if r.status == 'FAILED' %}
+              <tr><td colspan="6" style="padding:4px 8px 8px 8px;border-bottom:1px solid #e6eaee;background:#fff5f5;color:#8a2b2b;font-size:12px;">reason: {{ r.detail }}</td></tr>
+              {% endif %}
+              {% endfor %}
+            </table>
+            {% endif %}
+          </td></tr>
 
-          ==================================================================
-          CRITICAL SNAPSHOTS RETAINED — NOT YET {{ critical_retention_days }} DAYS OLD ({{ mail_critical_remaining | length }})
-          ==================================================================
-          {% if mail_critical_remaining | length == 0 %}
-          none
-          {% else %}
-          {{ '%-48s %-22s %-20s %6s %s' | format('SNAPSHOT NAME', 'SERVER / VM', 'RESOURCE GROUP', 'AGE', 'DELETE DUE IN') }}
-          {{ '-' * 122 }}
-          {% for r in mail_critical_remaining | sort(attribute='age_days', reverse=true) %}
-          {{ '%-48s %-22s %-20s %5sd %s' | format(r.name, r.owner_vm | default(r.vm_name | default('-')), r.resource_group | default('-'), r.age_days, (critical_retention_days | int - r.age_days | int) ~ ' day(s)') }}
-          {% endfor %}
-          {% endif %}
+          <tr><td style="padding:16px 22px 4px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">
+              CRITICAL snapshots retained - not yet {{ critical_retention_days }} days old ({{ mail_critical_remaining | length }})
+            </div>
+            {% if mail_critical_remaining | length == 0 %}
+            <div style="font-size:13px;color:#5a6672;">none</div>
+            {% else %}
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+              <tr style="background:#f0f3f6;">
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Snapshot name</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Server / VM</th>
+                <th align="left" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Resource group</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Age</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Deletes in</th>
+              </tr>
+              {% for r in mail_critical_remaining | sort(attribute='age_days', reverse=true) %}
+              <tr style="background:{{ '#ffffff' if loop.index is odd else '#fafbfc' }};">
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.name }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-family:Consolas,monospace;">{{ r.owner_vm | default(r.vm_name | default('-')) }}</td>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.resource_group | default('-') }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.age_days }}d</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-weight:600;color:#5d4a12;">{{ critical_retention_days | int - r.age_days | int }} day(s)</td>
+              </tr>
+              {% endfor %}
+            </table>
+            {% endif %}
+          </td></tr>
 
-          ==================================================================
-          PER SOURCE
-          ==================================================================
-          {% for r in deletion_results %}
-          {{ r.source }}
-            Snapshots found      : {{ r.found }}
-            Not ours (untouched) : {{ r.unmanaged }}
-            Critical in scope    : {{ r.critical_total | default(0) }}
-            Within retention     : {{ r.retained }}
-            Expired              : {{ r.expired | length }}
-            Deleted              : {{ r.deleted | length }}
-            Failures             : {{ r.failed | join(', ') if r.failed else 'none' }}
-          {% endfor %}
+          <tr><td style="padding:16px 22px 18px 22px;">
+            <div style="font-size:14px;font-weight:600;color:#1f2328;padding-bottom:6px;">Per source</div>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+              <tr style="background:#f0f3f6;">
+                <th align="left"  style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Source</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Found</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Not ours</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Critical</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Retained</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Expired</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Deleted</th>
+                <th align="right" style="padding:7px 8px;border-bottom:2px solid #cfd8e0;color:#41505e;">Failed</th>
+              </tr>
+              {% for r in deletion_results %}
+              <tr>
+                <td style="padding:6px 8px;border-bottom:1px solid #e6eaee;font-weight:600;">{{ r.source }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.found }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.unmanaged }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.critical_total | default(0) }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.retained }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.expired | length }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;">{{ r.deleted | length }}</td>
+                <td align="right" style="padding:6px 8px;border-bottom:1px solid #e6eaee;color:{{ '#a01b1b' if r.failed | length > 0 else '#5a6672' }};">{{ r.failed | length }}</td>
+              </tr>
+              {% endfor %}
+            </table>
+          </td></tr>
 
-          ------------------------------------------------------------------
-          Sent by delete_snapshots.yml
+          <tr><td style="padding:12px 22px;background:#f7f9fb;border-top:1px solid #e2e8ee;font-size:11px;color:#78838f;">
+            Generated by delete_snapshots.yml on {{ ansible_hostname | default('ansible controller') }}.
+            This is an automated message.
+          </td></tr>
+
+          </table>
+          </td></tr>
+          </table>
+          </body></html>
       when: send_summary_email | bool
 
     # A mail failure must not mask the run's own result, so this is best-effort
@@ -400,6 +497,8 @@
         from:     "{{ mail_from }}"
         subject: "{{ (mail_subject_dryrun_prefix | default('')) if dry_run | bool else '' }}{{ mail_subject }}"
         body: "{{ mail_body }}"
+        subtype: html
+        charset: utf-8
       register: mail_result
       failed_when: false
       when: send_summary_email | bool
